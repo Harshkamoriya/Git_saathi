@@ -299,7 +299,7 @@ const CreateProjectPage = () => {
                   </div>
 
                   <div className="text-center my-4 text-gray-500 dark:text-gray-400">
-                    - OR -
+                    OR
                   </div>
 
                   <label className="block text-gray-700 dark:text-gray-300 font-medium mb-2">
