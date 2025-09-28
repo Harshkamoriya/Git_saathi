@@ -167,13 +167,13 @@ export default function LoginForm() {
         </div>
         <div className="flex gap-4">
           <Link
-            href="https://www.linkedin.com/in/raghvendra1853/"
+            href="https://github.com/Harshkamoriya"
             className="transition-colors duration-200 hover:text-orange-500 dark:hover:text-pink-400"
           >
             LinkedIn
           </Link>
           <Link
-            href="https://x.com/Raghvendra56595"
+            href="https://x.com/harshkamoriya"
             className="transition-colors duration-200 hover:text-orange-500 dark:hover:text-pink-400"
           >
             Twitter

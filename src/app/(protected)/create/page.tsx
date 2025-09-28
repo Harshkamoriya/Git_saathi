@@ -303,7 +303,7 @@ const CreateProjectPage = () => {
                   </div>
 
                   <label className="block text-gray-700 dark:text-gray-300 font-medium mb-2">
-                    Direct URL Method
+                    Enter the Github repo Link
                   </label>
                   <div className="flex gap-4">
                     <Tooltip>

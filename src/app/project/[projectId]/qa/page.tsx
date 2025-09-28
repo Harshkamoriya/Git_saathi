@@ -226,7 +226,7 @@ export default function QA() {
               className="text-center py-12"
             >
               <Image src="/logo.png" alt="GitBuddy" width={80} height={80} className="mx-auto mb-4 opacity-70" />
-              <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">Welcome to GitBuddy</h2>
+              <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">Welcome to GitSaathi</h2>
               <p className="text-gray-500 dark:text-gray-400">Ask questions about your codebase and get detailed answers with code references.</p>
             </motion.div>
           )}
