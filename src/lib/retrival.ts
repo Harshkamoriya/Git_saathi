@@ -11,11 +11,18 @@ import { generateEmbedding } from "./repoEmbedding";
 import { Octokit } from "octokit";
 
 
+// interface FileReference {
+//   fileName: string;
+//   sourceCode: string;
+//   summary: string;
+//   score?: number;
+// }
+
 interface FileReference {
-  fileName: string;
-  sourceCode: string;
-  summary: string;
-  score?: number;
+  fileName : String;
+  sourceCode : String;
+  summary : String;
+  score?:number;
 }
 
 
@@ -49,6 +56,7 @@ interface SearchResult {
   summary: string;
   score: number;
 }
+
 
 /**
  * Searches Pinecone for embeddings with retry logic and caching

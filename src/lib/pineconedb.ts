@@ -47,6 +47,7 @@ export async function uploadToPinecone(vectors: PineconeRecord[], namespace: str
   }
   catch (error) {
     console.error("Error upserting vectors:", error);
+    console.log("marking project as FAILED");
     throw error;
   }
 }
