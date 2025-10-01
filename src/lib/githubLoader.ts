@@ -45,6 +45,7 @@ async function getFileCount(
     if (data.type === "file") return acc + 1;
     return acc;
   }
+  console.log(data ,"filecount ke dauran ka data")
 
   let fileCount = acc;
   const directories: string[] = [];
@@ -189,6 +190,8 @@ export const loadGithubRepo = async (githubUrl: string) => {
   }
   return docs;
 };
+
+
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Configuration for rate limiting and processing
@@ -209,6 +212,7 @@ export interface EmbeddingResult {
  * @param projectId - Unique identifier for the project (used as Pinecone namespace)
  * @param docs - Array of documents to process
  */
+
 export const RepoGenerateEmbeddings = async (
   projectId: string,
 ): Promise<EmbeddingResult[]> => {
