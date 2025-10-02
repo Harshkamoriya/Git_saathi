@@ -7,12 +7,12 @@ import { Github, Loader2, ArrowRight, Check, AlertTriangle, Server } from "lucid
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { checkCreditsAndStructure } from "@/lib/githubLoader";
-import { CreateProject } from "@/lib/query";
 import { fetchUserRepos } from "@/lib/githubLoader";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { CreateProject } from "@/lib/query";
 
 interface UserRepo {
   name: string;

@@ -4,6 +4,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 if (!process.env.GEMINI_API_KEY) {
   throw new Error("GEMINI_API_KEY is not defined in the environment variables");
 }
+// Initialize Google Generative AI client
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
 
@@ -24,6 +25,7 @@ function truncateText(text: string, maxBytes: number): string {
 /**
  * Checks if a vector is all zeros.
  */
+
 function isZeroVector(vector: number[]): boolean {
   return vector.every(v => v === 0);
 }
@@ -36,11 +38,12 @@ export async function generateEmbedding(text: string, retries: number = 3, timeo
   if (cached) {
     return cached;
   }
-
+// Truncate text if it exceeds the maximum payload size
   const truncatedText = truncateText(text, MAX_PAYLOAD_SIZE);
   if (truncatedText !== text) {
     console.warn(`Truncated text from ${text.length} to ${truncatedText.length} characters for embedding`);
   }
+// Retry logic with exponential backoff
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -64,6 +67,7 @@ export async function generateEmbedding(text: string, retries: number = 3, timeo
   }
   throw new Error("Unexpected exit from retry loop");
 }
+// function to generate embeddings in batches
 
 
 export async function generateEmbeddings(texts: string[], batchSize: number = 10): Promise<number[][]> {
