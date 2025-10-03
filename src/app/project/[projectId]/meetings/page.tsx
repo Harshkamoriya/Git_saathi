@@ -30,6 +30,8 @@ interface Props {
   params: Promise<{ projectId: string }>;
 }
 
+//  this is the meetings page 
+
 export default async function Home({ params }: Props) {
   const { projectId } = await params;
   const rawMeetings = await fetchMeetings(projectId);
