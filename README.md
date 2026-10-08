@@ -1,102 +1,259 @@
-# GitSaathi 🤖
+# GitSaathi
 
-GitSaathi (Hindi for "Git Companion") is a next-generation AI-powered GitHub assistant and context-aware project management hub. It transforms static repositories into interactive, queryable, and highly collaborative spaces tailored for agile development teams.
+**AI-powered GitHub companion for codebase Q&A, commit understanding, meeting intelligence, and repo analytics.**
 
-## 1. What is GitSaathi, Its Purpose, and The Problem It Solves
-
-### What is GitSaathi?
-GitSaathi is a full-stack Next.js application that tightly integrates with GitHub, Pinecone DB, and Google's Generative AI (Gemini) to act as an automated copilot for software teams. It provides chat-with-codebase capabilities, AI commit translations, and automated meeting issue extractions.
-
-### Purpose
-Its purpose is to **demystify complex codebases** and **streamline team synchronization**. Whether a developer is joining a legacy project, reviewing a massive PR, or catching up on a missed team standup, GitSaathi acts as an intelligent companion that can rapidly feed them the exact contextual knowledge they need to be productive.
-
-### What Problem does it solve and How?
-- **The Problem:** 
-  1. *Slow Developer Onboarding:* New developers take weeks to understand module dependencies and system architecture in large repositories.
-  2. *Cryptic Commits:* Commit messages are frequently vague, requiring reviewers to manually read raw git diffs to understand the conceptual changes.
-  3. *Lost Meeting Context:* Action items discussed in Google Meets or Zoom calls are often easily lost or rely on manual documentation.
-- **How it solves it:** 
-  1. **RAG on Repositories:** It generates vector embeddings of the entire codebase and stores them in Pinecone. Developers can then type natural language queries to ask the AI where specific logic lives, and the AI answers by retrieving the exact code snippets.
-  2. **Automated Summaries:** It utilizes Google Gemini to automatically translate massive raw `git diff` outputs into human-readable summaries.
-  3. **Audio-to-Issues:** Using AssemblyAI, teams can upload their daily standup audio recordings. GitSaathi transcribes the meeting and uses AI to distill it into actionable structured "Issues / Gists" stored right alongside the project.
+GitSaathi (Hindi for *Git Companion*) turns a GitHub repository into a collaborative workspace where teams can ask natural-language questions about code, review AI-summarized commits, upload meeting audio for action-item extraction, and inspect repo health — all in one place.
 
 ---
 
-## 2. Tech Stack Used & Why
+## Table of Contents
 
-| Technology | Purpose | Why it was chosen |
+- [Features](#features)
+- [How each feature works (for testing)](#how-each-feature-works-for-testing)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [Environment Variables](#environment-variables)
+- [Scripts](#scripts)
+- [Architecture Overview](#architecture-overview)
+- [Credits System](#credits-system)
+
+---
+
+## Features
+
+| Feature | Route | Purpose |
 |---|---|---|
-| **Next.js 15 (App Router)** | Framework | Next.js offers unified frontend/backend architecture. Features like Server Actions remove the need for boilerplate API routes, and Server Components drastically improve initial load times and SEO. |
-| **React 19 & Tailwind CSS** | UI / Styling | React provides dynamic UI states, while Tailwind's utility-first approach paired with Framer Motion and Radix UI components allows us to build a rich, animated, and accessible interactive interface rapidly. |
-| **Prisma & PostgreSQL** | Database | Prisma provides the absolute best-in-class end-to-end type safety for database operations. It pairs perfectly with PostgreSQL, providing a scalable and strong relational schema structure. |
-| **Google Generative AI (Gemini)** | Core LLM | Gemini offers immense context windows and powerful reasoning capabilities, making it ideal for deep code summarization and retrieval-augmented reasoning. |
-| **Pinecone & Langchain** | Vector Search | RAG requires high-dimensional vector similarity search capabilities. Pinecone enables millisecond queries across thousands of embedded repository code chunks. Langchain easily structures the context injection pipeline. |
-| **AssemblyAI** | Audio Processing | AssemblyAI holds leading accuracy for Speech-to-Text and speaker diarization, making it perfectly suited for transcribing messy team developer meetings. |
-| **NextAuth.js & Octokit** | Auth & Git API | NextAuth provides plug-and-play secure social logins (GitHub). Octokit offers a rich, typed API client wrapper to fetch commits, PRs, and issues seamlessly from GitHub. |
+| **Create Project** | `/create` | Link a GitHub repo, index it into Pinecone, deduct credits |
+| **Ask me (Q&A)** | `/project/[id]/qa` | Chat with the codebase using RAG + Gemini |
+| **Commits** | `/project/[id]/dashboard` | Poll GitHub commits and show AI summaries of diffs |
+| **Meetings** | `/project/[id]/meetings` | Upload standup/meeting audio → transcript + action items |
+| **Analytics** | `/project/[id]/analytics` | Contributors, commits/day, key commits, repo insights |
+| **PR and Issues** | `/project/[id]/prAndissue` | Live pull requests and issues from GitHub |
+| **Billing** | `/billing` | View / manage indexing credits |
+| **Join Project** | `/join/[projectId]` | Collaborate on an existing project via invite |
 
 ---
 
-## 3. API Endpoints & Functionality Classification
+## How each feature works (for testing)
 
-GitSaathi heavily utilizes **Next.js Server Actions** (`src/lib/...`) spanning across multiple dedicated modules instead of traditional REST APIs. Here is how they are classified based on functionally:
+### 1. Ask me (Q&A)
 
-### Project Architecture & Management (`query.ts`, `githubLoader.ts`)
-- `CreateProject`: Clones a GitHub repo, inspects the directory structure, deducts indexing credits, and initializes the Pinecone vectorization process.
-- `GetProjects` / `GetAllProjects`: Fetches projects associated with the active user.
-- `GetProjectById`: Retrieves detailed metadata for a single project dashboard.
-- `JoinProject`: Connects a secondary user to an existing collaborative workspace.
-- `allMembers`: Fetches all collaborators in the given project environment.
-- `loadGithubRepo`: The core pipeline router to parse GitHub directories, filter text files, and prepare them for indexing.
+**Purpose:** Answer questions about the linked repository using vector search over indexed source files.
 
-### GitHub Interactivity & Aggregation (`github.ts`, `github-insights.ts`)
-- `getCommitHashes` / `pollCommits`: Connects with the Octokit client to poll the remote repository for tracking incoming changes.
-- `getCommit` / `getCommits`: Retrieves the already synced and stored database commit chunks for rapid frontend rendering.
-- `summariseCommit` / `aiSummariseCommit`: Takes the raw string buffer of a `git diff`, passes it to the Gemini LLM, and persists a human-readable interpretation.
-- `getRepoStatus` / `PRandIssues`: Analytics endpoints that extract pull requests, CI/CD statuses, and pending issues from the remote GitHub endpoint.
+**Flow:**
+1. On create, files are embedded (`gemini-embedding-001`) and stored in a Pinecone namespace = `projectId`.
+2. A question is embedded, similar chunks are retrieved, then Gemini streams an answer with file references.
 
-### AI RAG Pipeline & Code Queries (`repoEmbedding.ts`, `retrival.ts`, `pineconedb.ts`)
-- `checkCreditsAndStructure`: Evaluates the user's remaining credit balance against the computed token size of the target repository before allowing indexing.
-- `generateEmbeddings` / `RepoGenerateEmbeddings`: Converts string chunks of source code into floating-point multidimensional vector arrays.
-- `uploadToPinecone`: Stores the vectorized documents into project-segregated namespaces in the Pinecone cloud.
-- `askQuestion`: The core QA endpoint. Receives natural language questions, computes its vector, similarity-matches in Pinecone, injects the code chunks into the Gemini context window, and streams back the nuanced answer.
+**How to test:**
+1. Open a project whose `indexingStatus` is `COMPLETED`.
+2. Go to **Ask me**.
+3. Ask: `What is this repository about?` or `Where is the hero component?`
+4. Expect: streamed markdown answer + file reference chips with scores.
 
-### Meeting Intelligence (`uploadToVercel.ts`, `assembly.ts`)
-- `uploadAudio`: Proxies large audio blobs from the client directly into Vercel Blob cloud storage.
-- `createMeeting`: Registers an audio URL tracking ticket into the Postgres database.
-- `fetchMeetings` / `fetchMeetingById`: Retrieves meeting states (Processing vs Completed).
-- `processMeeting`: A powerful async worker sequence that passes audio to AssemblyAI, gets the transcript back, prompts an LLM to find action items, and generates database `Issue` tokens.
+**If answers are empty / “no relevant information”:**
+- Confirm indexing finished (`COMPLETED` and vectors exist in Pinecone).
+- Reindex: `GET /api/reindex?projectId=<id>`
 
 ---
 
-## 4. Features and Facts of the Project
+### 2. Commits (Dashboard)
 
-**Core Features List:**
-- **Chat-with-Repo:** Interactive natural language UI that allows developers to ask architectural questions directly to the codebase.
-- **Smart Commit Dashboard:** Replaces ambiguous git logs with contextual AI-summarized insights on what exactly changed in each PR/Commit.
-- **Intelligent Meeting Transcription:** Enables developers to upload audio of standups, which the system automatically transcribes, summarizes, and extracts key actionable tasks/issues.
-- **Integrated Markdown Previews:** The UI is heavily focused on displaying rich, colorful markdown, code snippets, Mermaid graphs, and markdown editors beautifully without leaving the app.
-- **Project Analytics:** GitHub PRs, issues, and raw stats are fetched and presented on the GitSaathi dashboard.
-- **Collaborative Workspaces:** Members can join projects and view universal project knowledge, commits, and meetings simultaneously.
+**Purpose:** Make git history readable. Instead of cryptic messages alone, each new commit gets an AI summary of the actual diff.
 
-**Key Facts:**
-- The application implements an isolated **namespace architecture** in the Vector Database. Each project gets its isolated namespace so embedding similarities never cross-pollinate between different repositories.
-- The platform uses a **Credit System**, initializing each new user with `200` credits, charging relative sizes for repository structural indexing.
-- GitSaathi does away with explicit API routes, opting instead for heavy Server Actions mapped to asynchronous client calls.
+**Flow:**
+1. Dashboard loads → `pollCommits(projectId)` fetches recent commits via Octokit.
+2. Unprocessed commits are filtered against the `Commit` table.
+3. Each new commit’s patch/diff is summarized with Gemini and saved (`commitMessage`, `summary`, author, hash, date).
+4. UI shows a timeline with author avatar, message, AI summary, and link to GitHub.
 
----
+**How to test:**
+1. Open **Commits** for a project with a public GitHub URL and valid `GITHUB_TOKEN`.
+2. Wait for the first poll, or click **Refresh**.
+3. Expect: commit cards with AI summaries (not just raw messages).
+4. Push a new commit on GitHub → Refresh → new entry with a fresh summary.
 
-## 5. Potential Improvements
-
-- **Omni-Model Provider Setup:** Allow teams to dictate their preferred LLMs beyond Gemini via API key overrides (e.g., Anthropic Claude 3.5 Sonnet, OpenAI GPT-4o) specifically for the dense RAG QA.
-- **Two-Way GitHub Syncing:** Provide a capability to push AssemblyAI generated "Issues" straight back into the real GitHub Issues tab of the remote repo automatically.
-- **IDE Integrations:** Bundle the backend as an endpoint for a potential VSCode / JetBrains extension so developers can query GitSaathi directly from their local editor.
-- **Real-time Subscriptions:** Migrate the commit polling architecture towards GitHub Webhooks coupled with WebSockets/Server-Sent Events for real-time dashboard reactivity without the need to refresh.
-- **Granular RBAC:** Move from the flat "Member" model to granular roles (Admin, Contributor, Read-Only Observer) to protect sensitive features like meeting deletion or triggering project re-indexes.
+**Needs:** `GITHUB_TOKEN`, `GEMINI_API_KEY`, linked `githubUrl` on the project.
 
 ---
 
-## 6. Summary of the Project
+### 3. Meetings
 
-**GitSaathi** represents a massive leap forward in developer-environment utilities. By unifying Vector Databases for instantaneous codebase querying, AssemblyAI for capturing elusive conversational context from meetings, and deep integration with GitHub’s data flow, GitSaathi becomes the "brain" for its users’ development lifespan. 
+**Purpose:** Capture standup / sync call audio so discussion does not get lost. Audio is transcribed and split into chapter-style “issues” (gist, headline, summary, timestamps).
 
-It successfully solves the pain points of code obfuscation, poor documentation, and un-tracked meeting dialogues. As an end product, it doesn't just offer an administration dashboard; it offers an active assistant that saves countless hours of developer onboarding and code reviewing, ultimately maximizing squad productivity and code comprehension.
+**Flow:**
+1. Upload audio on **Meetings** → stored (Vercel Blob) → `Meeting` row created (`PROCESSING`).
+2. `processMeeting` sends audio to AssemblyAI with `auto_chapters: true`.
+3. Chapters become `Issue` rows; meeting status → `COMPLETED`.
+4. Open a meeting to read headlines, time ranges, and summaries.
+
+**How to test:**
+1. Go to **Meetings** → upload a short `.mp3` / `.wav` / `.m4a` (a spoken standup works best).
+2. Confirm the meeting appears as **PROCESSING**, then **COMPLETED**.
+3. Open the meeting detail page and verify chapter gists / headlines / summaries.
+
+**Needs:** `ASSEMBLYAI_API_KEY`, Vercel Blob token / upload config.
+
+---
+
+### 4. Analytics
+
+**Purpose:** High-level repo health — commit volume over time, contributors, impactful commits, and related insights from GitHub.
+
+**How to test:** Open **Analytics** on an indexed project with enough commit history. Charts and contributor cards should populate.
+
+---
+
+### 5. PR and Issues
+
+**Purpose:** Surface open/closed pull requests and issues from the linked GitHub repo without leaving GitSaathi.
+
+**How to test:** Open **PR and Issues**. Expect lists synced from GitHub for the project’s `owner/repo`.
+
+---
+
+### 6. Create / Invite / Billing
+
+- **Create:** Connect username or paste a GitHub URL → credit check → index → redirect to Q&A.
+- **Invite:** From dashboard, invite teammates; they join via `/join/[projectId]`.
+- **Billing:** Inspect remaining credits (indexing cost ≈ file count).
+
+---
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Framework | Next.js 15 (App Router), React 19 |
+| Auth | NextAuth.js (GitHub / Google) |
+| Database | PostgreSQL + Prisma |
+| Vector DB | Pinecone |
+| LLM / Embeddings | Google Gemini (`gemini-3.8-flash`, `gemini-embedding-001`) |
+| GitHub API | Octokit |
+| Meeting transcription | AssemblyAI |
+| UI | Tailwind CSS, Radix UI, Framer Motion |
+| File storage | Vercel Blob (meeting audio) |
+
+---
+
+## Project Structure
+
+```text
+src/
+  app/
+    (protected)/          # create, projects, billing, join
+    project/[projectId]/  # dashboard, qa, meetings, analytics, prAndissue
+    api/                  # auth, reindex helpers
+  components/             # commit-log, meetings-list, upload-audio, sidebars, UI
+  lib/
+    retrival.ts           # RAG Q&A
+    githubLoader.ts       # repo load + embedding pipeline
+    github.ts             # commit polling + summarization
+    github-insights.ts    # analytics
+    assembly.ts           # meeting transcription
+    repoEmbedding.ts      # embedding generation
+    pineconedb.ts         # Pinecone upsert / client
+    query.ts              # project/commit server actions
+prisma/
+  schema.prisma           # User, Project, Commit, Meeting, Issue, ...
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- PostgreSQL database
+- Pinecone index named `gitbuddy` (dimension **768**)
+- API keys listed below
+
+### Install
+
+```bash
+npm install
+npx prisma generate
+npx prisma db push
+```
+
+### Run
+
+```bash
+npm run dev
+```
+
+App defaults to [http://localhost:3000](http://localhost:3000) (or the next free port, e.g. `3001`).
+
+---
+
+## Environment Variables
+
+Create `.env.local` in the project root:
+
+```env
+DATABASE_URL=
+NEXTAUTH_URL=http://localhost:3000
+NEXTAUTH_SECRET=
+
+GITHUB_CLIENT_ID=
+GITHUB_CLIENT_SECRET=
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+
+GITHUB_TOKEN=
+GEMINI_API_KEY=
+PINECONE_API_KEY=
+
+ASSEMBLYAI_API_KEY=
+# Vercel Blob (for meeting audio uploads)
+BLOB_READ_WRITE_TOKEN=
+```
+
+---
+
+## Scripts
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Start Next.js (Turbopack) |
+| `npm run build` | Production build |
+| `npm run start` | Start production server |
+| `npm run lint` | ESLint |
+| `npx prisma studio` | Browse database |
+
+**Helpers:**
+- Reindex a project: `GET /api/reindex?projectId=<id>`
+- Top up credits (dev): `GET /api/add-credits` (if enabled)
+
+---
+
+## Architecture Overview
+
+```text
+GitHub Repo
+    │
+    ├─► Indexing (githubLoader) ─► Embeddings ─► Pinecone namespace(projectId)
+    │                                              │
+    │                                              └─► Ask me (RAG + Gemini stream)
+    │
+    ├─► pollCommits ─► Gemini diff summary ─► Commit table ─► Dashboard
+    │
+    └─► Insights / PRs / Issues ─► Analytics & PR pages
+
+Meeting audio ─► Vercel Blob ─► AssemblyAI chapters ─► Issue rows ─► Meetings UI
+```
+
+---
+
+## Credits System
+
+- New users start with **200** credits (Prisma default).
+- Creating/indexing a project costs roughly **1 credit per file** counted in the repo.
+- Q&A and commit summarization use Gemini separately (API quotas), not the same credit meter.
+
+---
+
+## License
+
+Private / unpublished unless otherwise stated by the repository owner.

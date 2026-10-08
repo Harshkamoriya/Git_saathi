@@ -90,18 +90,22 @@ const CreateProjectPage = () => {
       return result;
     },
     onSuccess: (data) => {
-      toast.success("Project created successfully");
+      if (data.indexingFailed) {
+        toast.warning(data.message || "Project created, but indexing failed");
+      } else {
+        toast.success(data.message || "Project created successfully");
+      }
       resetForm();
       setIsCreating(false);
       setProgress(null);
-      router.push(`/project/${data.project.id}/qa`);
+      router.push(`/project/${data.project.id}/dashboard`);
     },
     onError: (error) => {
       setError(`Project creation failed: ${(error as Error).message}`);
       toast.error(`Project creation failed: ${(error as Error).message}`);
       setIsCreating(false);
       setProgress(null);
-      resetForm();
+      // Do not reset the whole form — keep name/url so the user can retry
     },
   });
 

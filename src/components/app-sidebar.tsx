@@ -3,7 +3,7 @@
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Bot, CreditCard, LayoutDashboard, Presentation, Plus, PlusCircle, ChevronLeft, ChevronRight, ProjectorIcon } from 'lucide-react';
-import { usePathname } from "next/navigation";
+import { useParams, usePathname } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import {
@@ -51,6 +51,7 @@ const items = [
 
 export function AppSidebar() {
   const pathname = usePathname();
+  const params = useParams<{ projectId?: string }>();
   const { open, setOpen } = useSidebar();
   const [isOpen, setIsOpen] = useState(open);
   
@@ -64,9 +65,11 @@ export function AppSidebar() {
     setIsOpen(!isOpen);
   };
 
-  // Extract projectId from the pathname
+  // Prefer route params so Ask me / Meetings never jump to another project
   const segments = pathname.split("/").filter(Boolean);
-  const projectId = segments[1];
+  const projectId =
+    (typeof params.projectId === "string" && params.projectId) ||
+    (segments[0] === "project" ? segments[1] : undefined);
 
   // Determine the current page for highlighting
   const currentPage = segments[2] || "";
@@ -92,9 +95,12 @@ export function AppSidebar() {
             <SidebarMenu>
               {items.map((item) => (
                 <SidebarMenuItem key={item.title}>
-                  <SidebarMenuButton asChild>
+                  <SidebarMenuButton asChild disabled={!projectId}>
                     <Link
-                      href={`/project/${projectId}/${item.url}`}
+                      href={projectId ? `/project/${projectId}/${item.url}` : "#"}
+                      onClick={(e) => {
+                        if (!projectId) e.preventDefault();
+                      }}
                       className={cn(
                         "flex items-center gap-2 p-2 rounded-md transition-colors duration-200 ease-in-out",
                         currentPage === item.url

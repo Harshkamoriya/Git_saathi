@@ -9,43 +9,64 @@ import { redirect } from "next/navigation";
 export async function CreateProject(githubUrl: string, name: string) {
   const session = await getAuthSession();
   const userId = session?.user?.id;
-  if(!session) redirect("/login");
+  if (!session) redirect("/login");
 
   if (!userId) throw new Error("Unauthorized");
+  if (!name?.trim()) throw new Error("Project name is required");
+
+  // Credit check before any DB writes
+  const { fileCount, userCredits } = await checkCreditsAndStructure(githubUrl);
+  if (fileCount > userCredits) {
+    throw new Error("Insufficient credits");
+  }
+
+  // Create project + membership first so a later indexing failure does not
+  // leave the UI saying "failed" while the project already exists.
+  const project = await prisma.project.create({
+    data: {
+      name: name.trim(),
+      githubUrl,
+      indexingStatus: "INDEXING",
+    },
+  });
+
+  await prisma.userToProject.create({
+    data: {
+      userId,
+      projectId: project.id,
+    },
+  });
+
+  await prisma.user.update({
+    where: { id: userId },
+    data: { credits: { decrement: fileCount } },
+  });
 
   try {
-    if (!name) throw new Error("Project name is required");
-
-    // Check credits
-    const { fileCount, userCredits } = await checkCreditsAndStructure(githubUrl);
-    if (fileCount > userCredits) throw new Error("Insufficient credits");
-
-    // Create project without file structure
-    const project = await prisma.project.create({
-      data: {
-        name,
-        githubUrl,
-      },
-    });
-    await prisma.userToProject.create({
-      data: {
-        userId,
-        projectId: project.id,
-      },
-    });
-
-    // Deduct credits
-    await prisma.user.update({
-      where: { id: userId },
-      data: { credits: { decrement: fileCount } },
-    });
     await RepoGenerateEmbeddings(project.id);
-    return { project, message: "Project created successfully" };
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { indexingStatus: "COMPLETED" },
+    });
+    return {
+      project: { ...project, indexingStatus: "COMPLETED" },
+      message: "Project created and indexed successfully",
+      indexingFailed: false,
+    };
   } catch (error) {
-    console.error("Error creating project:", error);
-    throw new Error(`Failed to create project: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
+    console.error("Project created but indexing failed:", error);
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { indexingStatus: "FAILED" },
+    });
+    // Still return success — project exists and user can open / reindex it
+    return {
+      project: { ...project, indexingStatus: "FAILED" },
+      message:
+        "Project created, but indexing failed. Open the project and reindex from Ask me.",
+      indexingFailed: true,
+      indexingError: (error as Error).message,
+    };
   }
 }
 
@@ -160,6 +181,7 @@ export async function GetAllProjects() {
   try {
     const projects = await prisma.userToProject.findMany({
       where: { userId: userId as string },
+      orderBy: { createdAt: "desc" },
       include: {
         project: {
           include: {

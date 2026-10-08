@@ -39,7 +39,8 @@ const pinecone = getPineconeClient();
 
 // Configuration
 const TOP_K = 5;
-const SCORE_THRESHOLD = 0.7;
+// Cosine scores for short/generic queries are often < 0.7; keep a lower floor
+const SCORE_THRESHOLD = 0.15;
 const MAX_RETRIES = 3;
 const BASE_RETRY_DELAY_MS = 1000;
 
@@ -97,8 +98,14 @@ async function searchEmbeddings(query: string, namespace: string): Promise<Searc
       includeMetadata: true,
     });
 
-    return (queryResult.matches || [])
-      .filter((match) => match.score && match.score > SCORE_THRESHOLD)
+    const rawMatches = queryResult.matches || [];
+    console.log(
+      `Pinecone raw matches for ns=${namespace}:`,
+      rawMatches.map((m) => ({ id: m.id, score: m.score, file: m.metadata?.fileName }))
+    );
+
+    return rawMatches
+      .filter((match) => typeof match.score === "number" && match.score > SCORE_THRESHOLD)
       .map((match) => ({
         fileName: match.metadata?.fileName as string,
         sourceCode: match.metadata?.sourceCode as string,
@@ -157,6 +164,16 @@ export async function askQuestion(question: string, projectId: string) {
 
   if (!project?.githubUrl) {
     stream.update("Error: Project has no GitHub URL.");
+    stream.done();
+    return { output: stream.value, filesReferences: [] };
+  }
+
+  if (project.indexingStatus !== "COMPLETED") {
+    stream.update(
+      `This project is not indexed yet (status: ${project.indexingStatus}). ` +
+        `Embeddings must finish uploading to Pinecone before Q&A can work. ` +
+        `Reindex via /api/reindex?projectId=${projectId} and try again.`
+    );
     stream.done();
     return { output: stream.value, filesReferences: [] };
   }
@@ -230,81 +247,71 @@ export async function askQuestion(question: string, projectId: string) {
       \n\n`;
   }
 
+  const answerPrompt = `
+You are GitBuddy, an AI assistant that helps developers understand GitHub repositories.
+Answer clearly in Markdown using ONLY the context below. If the context is weak, still give the best grounded answer you can and say what is uncertain.
+
+START CONTEXT BLOCK
+${context}
+END OF CONTEXT BLOCK
+
+START QUESTION
+${question}
+END OF QUESTION
+`;
+
+  // Prefer models that currently work on free/new API keys; fall back on quota/empty
+  const modelCandidates = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.8-flash",
+  ] as const;
+
   // Stream answer
   (async () => {
-    try {
-      const { textStream } = await streamText({
-        model: google("gemini-1.5-flash"),
-        prompt: `
-          You are **GitBuddy**, an intelligent AI assistant designed to help technical interns understand and navigate GitHub repositories. Your task is to provide clear, actionable, and professional responses in **Markdown format**, tailored to the user's query. You can analyze code, suggest improvements, identify errors, or provide general guidance based on the context provided.
+    let lastError: unknown = null;
 
-          ---
+    for (const modelName of modelCandidates) {
+      try {
+        let fullText = "";
+        const { textStream, text } = await streamText({
+          model: google(modelName),
+          prompt: answerPrompt,
+        });
 
-          ## ✅ **Guidelines for Responses**
+        for await (const delta of textStream) {
+          fullText += delta;
+          stream.update(fullText);
+        }
 
-          ### 1. **Markdown Formatting**
-          - Use **headings** (\`#\`, \`##\`, \`###\`) to organize content logically.
-          - Use **bullet points** and **numbered lists** for clarity.
-          - For code snippets, use **code blocks** (\`\`\`language) with the appropriate language (e.g., \`typescript\`, \`javascript\`).
-          - Apply **bold** or *italic* text for emphasis where needed.
+        // Some SDK/model combos leave the iterator empty; await final text
+        if (!fullText.trim()) {
+          const finalText = await text;
+          if (finalText?.trim()) {
+            fullText = finalText;
+            stream.update(fullText);
+          }
+        }
 
-          ### 2. **Response Style**
-          - Be **concise** yet **comprehensive**—focus on the user's query while simplifying complex concepts.
-          - Use a **friendly, approachable tone** with a professional edge, suitable for technical interns.
-          - Provide **step-by-step explanations** for code improvements or error fixes.
-          - Highlight **key takeaways** or practical insights (e.g., "This file handles routing").
+        if (fullText.trim()) {
+          stream.done();
+          return;
+        }
 
-          ### 3. **Handling Specific Query Types**
-          - **Code Improvement (e.g., "improve the styling and UI")**:
-            - Analyze the provided code and suggest specific improvements in styling, UI, or structure.
-            - Provide a revised version of the code with explanations for each change.
-            - Focus on modern best practices (e.g., Tailwind CSS, responsive design, accessibility).
-          - **Error Detection (e.g., "tell me the error in the file")**:
-            - Analyze the code for syntax errors, logical issues, or potential bugs.
-            - Explain the error in simple terms and provide a corrected version of the code.
-            - Suggest best practices to avoid similar issues in the future.
-          - **General Queries**:
-            - Summarize the file's purpose, functionality, or role in the project using the provided summary.
-            - Provide actionable advice based on the query (e.g., "To change the homepage, edit this file").
-
-          ### 4. **Edge Cases**
-          - If the file content is incomplete, indicate the gap and provide a logical interpretation.
-          - If the query is unrelated to the file, respond with: "This query doesn't seem related to the provided file. Try asking something more specific or check the repo directly."
-          - If no actionable insights can be provided, say: "I'm sorry, but I don't have enough data to answer this fully. Try asking something more specific or check the repo directly."
-
-          ### 5. **Leverage Structured Summaries**
-          - The context includes detailed summaries for each file, structured with sections like "Overview", "Key Components", "Interactions", "Dependencies", and "Key Takeaways".
-          - Use these summaries to answer general queries about the file's purpose or role.
-          - For code-specific queries (e.g., improvements, errors), analyze the "Code Content" section in addition to the summary.
-
-          ---
-
-          ## 🚀 **Task**
-          You are GitBuddy, an AI code assistant helping technical interns navigate a GitHub repository.
-          Provide clear, step-by-step answers in markdown syntax, including code snippets where relevant.
-          Traits: expert knowledge, helpfulness, cleverness, articulateness, friendly, kind, and inspiring.
-          Use the context below to answer accurately, avoiding invented information.
-
-          START CONTEXT BLOCK
-          ${context}
-          END OF CONTEXT BLOCK
-
-          START QUESTION
-          ${question}
-          END OF QUESTION
-
-          If the context lacks sufficient information, say: "I'm sorry, but I don't have enough data from the repository to answer this fully. Try asking something more specific or check the repo directly."
-        `,
-      });
-
-      for await (const delta of textStream) {
-        stream.update(delta);
+        console.warn(`Model ${modelName} returned empty text; trying next model…`);
+      } catch (error) {
+        lastError = error;
+        console.error(`Model ${modelName} failed for project ${projectId}:`, error);
       }
-      stream.done();
-    } catch (error) {
-      console.error(`Error generating answer for project ${projectId}:`, error);
-      stream.error("Unable to generate an answer due to an error.");
     }
+
+    const message =
+      lastError instanceof Error
+        ? `Unable to generate an answer: ${lastError.message}`
+        : "I retrieved relevant files, but every Gemini model returned an empty answer. Check API quota/billing and try again.";
+    stream.update(message);
+    stream.done();
   })();
 
   return { output: stream.value, filesReferences };

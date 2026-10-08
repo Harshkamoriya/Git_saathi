@@ -6,7 +6,7 @@ import { Document } from '@langchain/core/documents';
 
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
 
 // Constants for chunk size and retry configuration
 const CHUNK_SIZE = 15000; // Adjust based on API token limits

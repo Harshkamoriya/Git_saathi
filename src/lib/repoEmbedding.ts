@@ -5,8 +5,10 @@ if (!process.env.GEMINI_API_KEY) {
   throw new Error("GEMINI_API_KEY is not defined in the environment variables");
 }
 // Initialize Google Generative AI client
+// text-embedding-004 was shut down Jan 2026; use gemini-embedding-001
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "text-embedding-004" });
+const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+const EMBEDDING_DIMENSIONS = 768; // match Pinecone index / former text-embedding-004 size
 
 const embeddingCache = new Map<string, number[]>();
 const MAX_PAYLOAD_SIZE = 9000;
@@ -50,7 +52,13 @@ export async function generateEmbedding(text: string, retries: number = 3, timeo
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Embedding timeout")), timeoutMs)
       );
-      const embeddingPromise = model.embedContent(truncatedText).then(result => result.embedding.values);
+      // outputDimensionality exists on the API but is missing from SDK 0.24 types
+      const embeddingPromise = model
+        .embedContent({
+          content: { role: "user", parts: [{ text: truncatedText }] },
+          outputDimensionality: EMBEDDING_DIMENSIONS,
+        } as never)
+        .then((result) => result.embedding.values);
       const embedding = await Promise.race([embeddingPromise, timeoutPromise]);
       if (isZeroVector(embedding)) {
         throw new Error("API returned an all-zero vector");

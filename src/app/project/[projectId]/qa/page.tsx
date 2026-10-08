@@ -12,9 +12,11 @@ import Image from "next/image";
 import { readStreamableValue } from "ai/rsc";
 import CodeReferencePanel from "@/components/code-references";
 import { MemoizedMarkdown } from "@/components/memorized-markdown";
-import { usePathname } from "next/navigation";
+import { useParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
+import { useQuery } from "@tanstack/react-query";
+import { GetProjectById } from "@/lib/query";
 
 interface FileReference {
   fileName: string;
@@ -39,9 +41,14 @@ interface StoredMessages {
 //  this is the qa page 
 
 export default function QA() {
-  const path = usePathname();
-  const parts = path.split("/");
-  const projectId = parts[2];
+  const params = useParams<{ projectId: string }>();
+  const projectId = params.projectId;
+
+  const { data: project } = useQuery({
+    queryKey: ["project", projectId],
+    queryFn: () => GetProjectById(projectId),
+    enabled: !!projectId,
+  });
 
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
@@ -158,10 +165,11 @@ export default function QA() {
       const { output, filesReferences } = await askQuestion(currentQuestion, projectId);
       setActiveReferences(filesReferences);
 
+      // createStreamableValue yields the latest full value on each update (not raw deltas)
       let fullAnswer = "";
-      for await (const delta of readStreamableValue(output)) {
-        if (delta) {
-          fullAnswer += delta;
+      for await (const value of readStreamableValue(output)) {
+        if (typeof value === "string") {
+          fullAnswer = value;
           setActiveAnswer(fullAnswer);
         }
       }
@@ -211,10 +219,30 @@ export default function QA() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200 dark:from-gray-900 dark:to-gray-800 flex flex-col">
-      {/* Header */}
-      <div className="p-4 bg-white dark:bg-gray-800 shadow-sm flex items-center gap-2">
-        <Image src="/logo.png" alt="GitBuddy" width={32} height={32} />
-        <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">GitBuddy</h1>
+      {/* Header — always show active project so context never feels "switched" */}
+      <div className="p-4 bg-white dark:bg-gray-800 shadow-sm flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2 min-w-0">
+          <Image src="/logo.png" alt="GitBuddy" width={32} height={32} />
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">Ask me</h1>
+            <p className="text-sm text-orange-500 truncate">
+              {project?.name || "Loading project…"}
+              {project?.githubUrl ? (
+                <span className="text-gray-500 dark:text-gray-400"> · {project.githubUrl.replace("https://github.com/", "")}</span>
+              ) : null}
+            </p>
+          </div>
+        </div>
+        <span
+          className={cn(
+            "text-xs px-2 py-1 rounded-full whitespace-nowrap",
+            project?.indexingStatus === "COMPLETED"
+              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+              : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+          )}
+        >
+          {project?.indexingStatus || "…"}
+        </span>
       </div>
 
       {/* Chat Area */}
@@ -228,8 +256,17 @@ export default function QA() {
               className="text-center py-12"
             >
               <Image src="/logo.png" alt="GitBuddy" width={80} height={80} className="mx-auto mb-4 opacity-70" />
-              <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">Welcome to GitSaathi</h2>
-              <p className="text-gray-500 dark:text-gray-400">Ask questions about your codebase and get detailed answers with code references.</p>
+              <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">
+                Ask about{" "}
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-orange-500 to-pink-500">
+                  {project?.name || "this project"}
+                </span>
+              </h2>
+              <p className="text-gray-500 dark:text-gray-400 max-w-lg mx-auto">
+                {project?.githubUrl
+                  ? `Connected to ${project.githubUrl.replace("https://github.com/", "")}. Ask anything about this repo.`
+                  : "Ask questions about your codebase and get detailed answers with code references."}
+              </p>
             </motion.div>
           )}
 

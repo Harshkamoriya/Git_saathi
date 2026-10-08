@@ -40,10 +40,7 @@ export async function uploadToPinecone(vectors: PineconeRecord[], namespace: str
     }));
     await ns.upsert(sanitizedVectors);
     console.log("Vectors upserted successfully.");
-    await prisma.project.update({
-      where: { id: namespace },
-      data: { indexingStatus: "COMPLETED" },
-    });
+    // indexingStatus is finalized by CreateProject / reindex after ALL batches finish
   }
   catch (error) {
     console.error("Error upserting vectors:", error);

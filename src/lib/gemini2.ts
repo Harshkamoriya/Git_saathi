@@ -6,7 +6,7 @@ import { Document } from '@langchain/core/documents';
 
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_2 || "");
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
 
 
 export async function summariseCode_2(doc: Document): Promise<string> {
