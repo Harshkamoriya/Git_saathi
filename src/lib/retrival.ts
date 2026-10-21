@@ -1,11 +1,11 @@
 "use server";
 
-import {streamText } from 'ai'
-import {createStreamableValue} from 'ai/rsc'
-import{ createGoogleGenerativeAI} from '@ai-sdk/google'
+import { createStreamableValue } from "ai/rsc";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 import { getPineconeClient } from "@/lib/pineconedb";
 import { prisma } from "@/lib/db";
+import { getAuthSession } from "./auth";
 
 import { generateEmbedding } from "./repoEmbedding";
 import { Octokit } from "octokit";
@@ -26,9 +26,7 @@ interface FileReference {
 }
 
 
-const google = createGoogleGenerativeAI({
-    apiKey: process.env.GEMINI_API_KEY,
-  });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
 const octokit = new Octokit({
   auth: process.env.GITHUB_TOKEN,
@@ -132,12 +130,15 @@ function normalizeResults(results: SearchResult[]): SearchResult[] {
 async function retrieveVectorResults(query: string, namespace: string): Promise<SearchResult[]> {
   const vectorResults = await searchEmbeddings(query, namespace);
   const normalizedResults = normalizeResults(vectorResults);
-console.log("normalizedResults", normalizedResults);
+  console.log(
+    "normalizedResults",
+    normalizedResults.map((r) => ({ file: r.fileName, score: Number(r.score.toFixed(3)) }))
+  );
   const sortedResults = normalizedResults.sort((a, b) => b.score - a.score);
   const uniqueResults: { [key: string]: SearchResult } = {};
 
   for (const result of sortedResults) {
-    if (!uniqueResults[result.fileName] && result.fileName.trim()) {
+    if (result.fileName?.trim() && !uniqueResults[result.fileName]) {
       uniqueResults[result.fileName] = result;
       if (Object.keys(uniqueResults).length === TOP_K) break;
     }
@@ -149,12 +150,104 @@ console.log("normalizedResults", normalizedResults);
 // /**
 //  * Enhanced askQuestion function with Pinecone retrieval
 //  */
+const ANSWER_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.6-flash"] as const;
+const MODEL_TIMEOUT_MS = 25000;
+
+function isFallbackSummary(summary: string | undefined) {
+  return /could not be determined due to an error/i.test(summary || "");
+}
+
+async function generateAnswer(prompt: string): Promise<string> {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error("GEMINI_API_KEY is not set");
+  }
+
+  let lastError: unknown = null;
+  for (const modelName of ANSWER_MODELS) {
+    try {
+      const model = genAI.getGenerativeModel({
+        model: modelName,
+        generationConfig: { maxOutputTokens: 2048, temperature: 0.2 },
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${modelName} timed out after ${MODEL_TIMEOUT_MS / 1000}s`)),
+          MODEL_TIMEOUT_MS
+        );
+      });
+      try {
+        const response = await Promise.race([model.generateContent(prompt), timeout]);
+        const text = response.response.text().trim();
+        if (text) {
+          console.log(`Answer generated with ${modelName} (${text.length} chars)`);
+          return text;
+        }
+        console.warn(`Model ${modelName} returned empty text`);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    } catch (error) {
+      lastError = error;
+      console.error(
+        `Model ${modelName} failed:`,
+        error instanceof Error ? error.message : error
+      );
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Every Gemini model returned an empty answer");
+}
+
+function friendlyError(error: unknown) {
+  const code = (error as { code?: string })?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  if (code === "P1001" || code === "P1002" || code === "P2024" || /Can't reach database server/i.test(message)) {
+    return "The database is waking up or unreachable right now. Wait a few seconds and send your question again.";
+  }
+  if (/fetch failed|ENOTFOUND|ECONNRESET|ETIMEDOUT/i.test(message)) {
+    return "A network request failed while answering. Check your internet connection and try again.";
+  }
+  return "Something went wrong while answering. Please try again.";
+}
+
 export async function askQuestion(question: string, projectId: string) {
+  try {
+    return await answerQuestion(question, projectId);
+  } catch (error) {
+    console.error(`askQuestion failed for project ${projectId}:`, error);
+    const stream = createStreamableValue();
+    stream.update(friendlyError(error));
+    stream.done();
+    return { output: stream.value, filesReferences: [] as SearchResult[] };
+  }
+}
+
+async function answerQuestion(question: string, projectId: string) {
   console.log("Asking question:", question);
   console.log("For project:", projectId);
-  // console.log("process.env.GEMINI_API_KEY", process.env.GEMINI_API_KEY);
 
   const stream = createStreamableValue();
+
+  const session = await getAuthSession();
+  const userId = session?.user?.id;
+  if (!userId) {
+    stream.update("Please sign in again, then retry your question.");
+    stream.done();
+    return { output: stream.value, filesReferences: [] };
+  }
+
+  const membership = await prisma.userToProject.findUnique({
+    where: { userId_projectId: { userId, projectId } },
+    select: { id: true },
+  });
+  if (!membership) {
+    stream.update("You don't have access to this project.");
+    stream.done();
+    return { output: stream.value, filesReferences: [] };
+  }
 
   // Check project status
   const project = await prisma.project.findUnique({
@@ -170,9 +263,9 @@ export async function askQuestion(question: string, projectId: string) {
 
   if (project.indexingStatus !== "COMPLETED") {
     stream.update(
-      `This project is not indexed yet (status: ${project.indexingStatus}). ` +
-        `Embeddings must finish uploading to Pinecone before Q&A can work. ` +
-        `Reindex via /api/reindex?projectId=${projectId} and try again.`
+      project.indexingStatus === "INDEXING"
+        ? "This repo is still being indexed. Give it a minute, then ask again."
+        : "This repo isn't indexed yet. Press Reindex at the top of this page, then ask again."
     );
     stream.done();
     return { output: stream.value, filesReferences: [] };
@@ -184,11 +277,18 @@ export async function askQuestion(question: string, projectId: string) {
     filesReferences = await retrieveVectorResults(question, projectId);
   } catch (error) {
     console.error(`Error retrieving vector results for project ${projectId}:`, error);
-    stream.update("Unable to retrieve relevant files due to an error.");
+    stream.update("I couldn't search this repo's index just now. Try again, or press Reindex if it keeps failing.");
     stream.done();
     return { output: stream.value, filesReferences: [] };
   }
-  console.log("filesReferences", filesReferences);
+  console.log(
+    "filesReferences",
+    filesReferences.map((f) => ({
+      file: f.fileName,
+      score: Number(f.score.toFixed(3)),
+      fallbackSummary: isFallbackSummary(f.summary),
+    }))
+  );
 
   if (filesReferences.length === 0) {
     // Fallback to GitHub API if a specific file is mentioned
@@ -232,24 +332,28 @@ export async function askQuestion(question: string, projectId: string) {
     }
   }
 
-  // Build context, leveraging the structured summaries
+  const weakIndex = filesReferences.every((doc) => isFallbackSummary(doc.summary));
+
+  // Build context from real code. Indexing often stored an error template as the "summary".
   let context = "";
   for (const doc of filesReferences) {
+    const fallback = isFallbackSummary(doc.summary);
+    const codeLimit = fallback ? 6000 : 2500;
     context += `
       ### File: ${doc.fileName}
       #### Summary:
-      ${doc.summary}
+      ${fallback ? "Summary unavailable. Answer from the code excerpt." : doc.summary}
 
       #### Code Content:
       \`\`\`
-      ${doc.sourceCode.slice(0, 2000)}
+      ${(doc.sourceCode || "").slice(0, codeLimit)}
       \`\`\`
       \n\n`;
   }
 
   const answerPrompt = `
 You are GitBuddy, an AI assistant that helps developers understand GitHub repositories.
-Answer clearly in Markdown using ONLY the context below. If the context is weak, still give the best grounded answer you can and say what is uncertain.
+Answer clearly in Markdown using ONLY the context below. Ignore summaries that say the purpose could not be determined, and use the code excerpts instead. If the context is weak, still give the best grounded answer you can and say what is uncertain. Keep the answer under 400 words.
 
 START CONTEXT BLOCK
 ${context}
@@ -260,58 +364,29 @@ ${question}
 END OF QUESTION
 `;
 
-  // Prefer models that currently work on free/new API keys; fall back on quota/empty
-  const modelCandidates = [
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-flash-latest",
-    "gemini-3.8-flash",
-  ] as const;
-
-  // Stream answer
+  // Generate with a hard timeout, then push the finished answer.
+  // streamText on gemini-3.5-flash was leaving this stream open (no tokens, no .done()).
   (async () => {
-    let lastError: unknown = null;
-
-    for (const modelName of modelCandidates) {
-      try {
-        let fullText = "";
-        const { textStream, text } = await streamText({
-          model: google(modelName),
-          prompt: answerPrompt,
-        });
-
-        for await (const delta of textStream) {
-          fullText += delta;
-          stream.update(fullText);
-        }
-
-        // Some SDK/model combos leave the iterator empty; await final text
-        if (!fullText.trim()) {
-          const finalText = await text;
-          if (finalText?.trim()) {
-            fullText = finalText;
-            stream.update(fullText);
-          }
-        }
-
-        if (fullText.trim()) {
-          stream.done();
-          return;
-        }
-
-        console.warn(`Model ${modelName} returned empty text; trying next model…`);
-      } catch (error) {
-        lastError = error;
-        console.error(`Model ${modelName} failed for project ${projectId}:`, error);
-      }
+    try {
+      const answer = await generateAnswer(answerPrompt);
+      const note = weakIndex
+        ? "\n\n---\n_The search index for this repo is missing real file summaries, so this answer is based on the closest code excerpts. Use Reindex on this page, then ask again for a sharper result._"
+        : "";
+      stream.update(answer + note);
+    } catch (error) {
+      console.error(`Answer failed for project ${projectId}:`, error);
+      const raw = error instanceof Error ? error.message : "";
+      const message = /quota|429|rate/i.test(raw)
+        ? "The AI model is rate-limited right now. Wait a moment and try again."
+        : /timed out/i.test(raw)
+          ? "The AI model took too long to respond. Please try again."
+          : /API key|403|401|GEMINI_API_KEY/i.test(raw)
+            ? "The Gemini API key is missing or invalid. Check GEMINI_API_KEY in .env.local."
+            : "I found the relevant files but couldn't generate an answer. Please try again.";
+      stream.update(message);
+    } finally {
+      stream.done();
     }
-
-    const message =
-      lastError instanceof Error
-        ? `Unable to generate an answer: ${lastError.message}`
-        : "I retrieved relevant files, but every Gemini model returned an empty answer. Check API quota/billing and try again.";
-    stream.update(message);
-    stream.done();
   })();
 
   return { output: stream.value, filesReferences };

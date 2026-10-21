@@ -1,12 +1,11 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { askQuestion } from "@/lib/retrival";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Loader2, Send } from "lucide-react";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { Loader2, Send, RotateCw, Trash2, AlertTriangle } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import Image from "next/image";
 import { readStreamableValue } from "ai/rsc";
@@ -15,7 +14,7 @@ import { MemoizedMarkdown } from "@/components/memorized-markdown";
 import { useParams } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { GetProjectById } from "@/lib/query";
 
 interface FileReference {
@@ -31,176 +30,265 @@ interface Message {
   type: "question" | "answer";
   filesReferences?: FileReference[];
   timestamp: Date;
+  failed?: boolean;
+  question?: string;
 }
 
 interface StoredMessages {
   messages: Message[];
-  storedAt: number; // Timestamp in milliseconds
+  storedAt: number;
 }
 
-//  this is the qa page 
+const HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
+const ANSWER_TIMEOUT_MS = 90000;
+const MAX_STORED_MESSAGES = 50;
+
+const RAW_ERROR_PATTERN = /TURBOPACK|invocation in|PrismaClient|at async /;
+
+const SUGGESTIONS = [
+  "What is this project about?",
+  "How is the project structured?",
+  "Which libraries and frameworks does it use?",
+];
+
+function loadHistory(storageKey: string): StoredMessages | null {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredMessages;
+    if (Date.now() - parsed.storedAt >= HISTORY_TTL_MS) {
+      localStorage.removeItem(storageKey);
+      return null;
+    }
+    // Drop raw server stack traces saved by older builds
+    const messages = parsed.messages
+      .filter((m) => !(m.type === "answer" && RAW_ERROR_PATTERN.test(m.content)))
+      .map((m) => ({ ...m, timestamp: new Date(m.timestamp) }));
+    return { messages, storedAt: parsed.storedAt };
+  } catch {
+    localStorage.removeItem(storageKey);
+    return null;
+  }
+}
+
+function ReferenceChips({
+  references,
+  onOpen,
+}: {
+  references: FileReference[];
+  onOpen: (file: FileReference) => void;
+}) {
+  if (references.length === 0) return null;
+  return (
+    <div className="mt-3">
+      <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">
+        {references.length} file reference{references.length > 1 ? "s" : ""}
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {references.map((file) => (
+          <button
+            key={file.fileName}
+            type="button"
+            onClick={() => onOpen(file)}
+            className="max-w-full truncate text-xs px-3 py-1 bg-orange-100 dark:bg-orange-900/60 text-gray-700 dark:text-gray-300 rounded-full hover:bg-orange-200 dark:hover:bg-orange-800 transition-colors"
+          >
+            {file.fileName}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function BotAvatar() {
+  return (
+    <div className="w-9 h-9 rounded-full bg-orange-100 dark:bg-orange-900 flex items-center justify-center shrink-0">
+      <Image src="/logo.png" alt="GitBuddy" width={22} height={22} />
+    </div>
+  );
+}
 
 export default function QA() {
   const params = useParams<{ projectId: string }>();
   const projectId = params.projectId;
+  const storageKey = `chatMessages-${projectId}`;
 
-  const { data: project } = useQuery({
+  const queryClient = useQueryClient();
+  const {
+    data: project,
+    isError: projectError,
+    refetch: refetchProject,
+    isFetching: projectFetching,
+  } = useQuery({
     queryKey: ["project", projectId],
     queryFn: () => GetProjectById(projectId),
     enabled: !!projectId,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(2000 * 2 ** attempt, 10000),
+  });
+
+  const reindexMutation = useMutation({
+    mutationFn: async () => {
+      const res = await fetch(`/api/reindex?projectId=${projectId}`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error("Reindex failed. Please try again in a minute.");
+      }
+      return body;
+    },
+    onSuccess: () => {
+      toast.success("Reindex finished. Ask again for a sharper answer.");
+      queryClient.invalidateQueries({ queryKey: ["project", projectId] });
+    },
+    onError: (error: Error) => toast.error(error.message),
   });
 
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
-  const [activeAnswer, setActiveAnswer] = useState<string>("");
+  const [activeAnswer, setActiveAnswer] = useState("");
   const [activeReferences, setActiveReferences] = useState<FileReference[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [selectedReference, setSelectedReference] = useState<FileReference | null>(null);
   const [currentReferenceFiles, setCurrentReferenceFiles] = useState<FileReference[]>([]);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const storedAtRef = useRef<number | null>(null);
+  const loadingRef = useRef(false);
 
-  // Auto-resize textarea
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+      textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 150)}px`;
     }
   }, [question]);
 
-  // Scroll to bottom when messages or activeAnswer change
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, activeAnswer]);
+    const el = scrollRef.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [messages, activeAnswer, isLoading]);
 
-  // Load messages from local storage on mount (project-specific)
   useEffect(() => {
-    const storageKey = `chatMessages-${projectId}`;
-    const storedData = localStorage.getItem(storageKey);
-    if (storedData) {
-      const { messages: storedMessages, storedAt } = JSON.parse(storedData) as StoredMessages;
-      const now = Date.now();
-      const twoHoursInMs = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
+    const history = loadHistory(storageKey);
+    storedAtRef.current = history?.storedAt ?? null;
+    setMessages(history?.messages ?? []);
+  }, [storageKey]);
 
-      if (now - storedAt < twoHoursInMs) {
-        // Messages are still valid, load them
-        setMessages(
-          storedMessages.map((msg: Message) => ({
-            ...msg,
-            timestamp: new Date(msg.timestamp), // Convert timestamp back to Date
-          }))
-        );
-
-        // Set a timeout to clear messages after the remaining time
-        const remainingTime = twoHoursInMs - (now - storedAt);
-        timeoutRef.current = setTimeout(() => {
-          localStorage.removeItem(storageKey);
-          setMessages([]); // Clear messages in state
-        }, remainingTime);
-      } else {
-        // Messages are expired, clear them
-        localStorage.removeItem(storageKey);
-      }
-    }
-  }, [projectId]);
-
-  // Save messages to local storage whenever they change (project-specific)
   useEffect(() => {
-    const storageKey = `chatMessages-${projectId}`;
-    if (messages.length > 0) {
-      const data: StoredMessages = {
-        messages,
-        storedAt: Date.now(),
-      };
-      localStorage.setItem(storageKey, JSON.stringify(data));
-
-      // Clear any existing timeout
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
-
-      // Set a new timeout to clear messages after 2 hours
-      const twoHoursInMs = 2 * 60 * 60 * 1000; // 2 hours in milliseconds
-      timeoutRef.current = setTimeout(() => {
-        localStorage.removeItem(storageKey);
-        setMessages([]); // Clear messages in state
-      }, twoHoursInMs);
-    }
-
-    // Cleanup timeout on component unmount
-    return () => {
-      if (timeoutRef.current) {
-        clearTimeout(timeoutRef.current);
-      }
+    if (messages.length === 0) return;
+    if (!storedAtRef.current) storedAtRef.current = Date.now();
+    const data: StoredMessages = {
+      messages: messages.slice(-MAX_STORED_MESSAGES),
+      storedAt: storedAtRef.current,
     };
-  }, [messages, projectId]);
+    localStorage.setItem(storageKey, JSON.stringify(data));
 
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    if (!question.trim()) return;
+    const remaining = Math.max(0, HISTORY_TTL_MS - (Date.now() - storedAtRef.current));
+    const timer = setTimeout(() => {
+      localStorage.removeItem(storageKey);
+      storedAtRef.current = null;
+      setMessages([]);
+    }, remaining);
+    return () => clearTimeout(timer);
+  }, [messages, storageKey]);
 
-    const questionId = Date.now().toString();
+  const ask = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || loadingRef.current) return;
+      loadingRef.current = true;
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: questionId,
-        content: question,
-        type: "question",
-        timestamp: new Date(),
-      },
-    ]);
-
-    setActiveAnswer("");
-    setActiveReferences([]);
-    setIsLoading(true);
-    setSelectedReference(null); // Close any open reference panel
-
-    const currentQuestion = question;
-    setQuestion("");
-
-    try {
-      const { output, filesReferences } = await askQuestion(currentQuestion, projectId);
-      setActiveReferences(filesReferences);
-
-      // createStreamableValue yields the latest full value on each update (not raw deltas)
-      let fullAnswer = "";
-      for await (const value of readStreamableValue(output)) {
-        if (typeof value === "string") {
-          fullAnswer = value;
-          setActiveAnswer(fullAnswer);
-        }
-      }
-
+      const questionId = Date.now().toString();
       setMessages((prev) => [
         ...prev,
-        {
-          id: `answer-${questionId}`,
-          content: fullAnswer,
-          type: "answer",
-          filesReferences: filesReferences,
-          timestamp: new Date(),
-        },
+        { id: questionId, content: trimmed, type: "question", timestamp: new Date() },
       ]);
       setActiveAnswer("");
-    } catch (error) {
-      console.error("Error asking question:", error);
-      toast.error("Failed to get an answer. Please try again.");
+      setActiveReferences([]);
+      setIsLoading(true);
+      setSelectedReference(null);
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `error-${questionId}`,
-          content: "Sorry, I couldn't process your question. Please try again.",
-          type: "answer",
-          timestamp: new Date(),
-        },
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
+      let cancelled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      const pushAnswer = (answer: Omit<Message, "id" | "type" | "timestamp">) =>
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `answer-${questionId}`,
+            type: "answer",
+            timestamp: new Date(),
+            question: trimmed,
+            ...answer,
+          },
+        ]);
+
+      try {
+        await Promise.race([
+          (async () => {
+            const { output, filesReferences } = await askQuestion(trimmed, projectId);
+            if (cancelled) return;
+            setActiveReferences(filesReferences);
+
+            let fullAnswer = "";
+            for await (const value of readStreamableValue(output)) {
+              if (cancelled) return;
+              if (typeof value === "string") {
+                fullAnswer = value;
+                setActiveAnswer(value);
+              }
+            }
+            if (cancelled) return;
+
+            pushAnswer({
+              content: fullAnswer.trim() || "I couldn't produce an answer. Please try again.",
+              filesReferences,
+              failed: !fullAnswer.trim() || filesReferences.length === 0,
+            });
+          })(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              cancelled = true;
+              reject(new Error("timeout"));
+            }, ANSWER_TIMEOUT_MS);
+          }),
+        ]);
+      } catch (error) {
+        console.error("Error asking question:", error);
+        const timedOut = error instanceof Error && error.message === "timeout";
+        const message = timedOut
+          ? "This is taking too long. Please try again."
+          : "I couldn't reach the server. Check your connection and try again.";
+        toast.error(message);
+        pushAnswer({ content: message, failed: true });
+      } finally {
+        if (timer) clearTimeout(timer);
+        loadingRef.current = false;
+        setIsLoading(false);
+        setActiveAnswer("");
+        setActiveReferences([]);
+        textareaRef.current?.focus();
+      }
+    },
+    [projectId]
+  );
+
+  const handleSubmit = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (isLoading || !question.trim()) return;
+    const text = question;
+    setQuestion("");
+    ask(text);
+  };
+
+  const retry = (text: string) => {
+    if (!isLoading) ask(text);
+  };
+
+  const clearChat = () => {
+    localStorage.removeItem(storageKey);
+    storedAtRef.current = null;
+    setMessages([]);
   };
 
   const openReference = (file: FileReference, allReferences: FileReference[]) => {
@@ -213,209 +301,246 @@ export default function QA() {
     setCurrentReferenceFiles([]);
   };
 
-  const changeReference = (file: FileReference) => {
-    setSelectedReference(file);
-  };
+  const lastMessage = messages[messages.length - 1];
+  const unanswered = !isLoading && lastMessage?.type === "question" ? lastMessage : null;
+  const indexingStatus = reindexMutation.isPending ? "INDEXING" : project?.indexingStatus;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-100 to-gray-200 dark:from-gray-900 dark:to-gray-800 flex flex-col">
-      {/* Header — always show active project so context never feels "switched" */}
-      <div className="p-4 bg-white dark:bg-gray-800 shadow-sm flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2 min-w-0">
+    <div className="flex h-[calc(100dvh-8.5rem)] min-h-[28rem] flex-col overflow-hidden rounded-xl bg-gray-50 dark:bg-gray-900">
+      <div className="flex items-center justify-between gap-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
           <Image src="/logo.png" alt="GitBuddy" width={32} height={32} />
           <div className="min-w-0">
-            <h1 className="text-xl font-bold text-gray-800 dark:text-gray-100">Ask me</h1>
-            <p className="text-sm text-orange-500 truncate">
-              {project?.name || "Loading project…"}
-              {project?.githubUrl ? (
-                <span className="text-gray-500 dark:text-gray-400"> · {project.githubUrl.replace("https://github.com/", "")}</span>
-              ) : null}
-            </p>
+            <h1 className="text-lg font-bold text-gray-800 dark:text-gray-100">Ask me</h1>
+            {projectError ? (
+              <button
+                type="button"
+                onClick={() => refetchProject()}
+                className="flex items-center gap-1 text-sm text-amber-600 dark:text-amber-400 hover:underline"
+              >
+                <AlertTriangle className="h-3.5 w-3.5" />
+                Couldn&apos;t load project details. Retry
+              </button>
+            ) : (
+              <p className="truncate text-sm text-orange-500">
+                {project?.name || (projectFetching ? "Loading project…" : "")}
+                {project?.githubUrl ? (
+                  <span className="text-gray-500 dark:text-gray-400">
+                    {" · "}
+                    {project.githubUrl.replace("https://github.com/", "")}
+                  </span>
+                ) : null}
+              </p>
+            )}
           </div>
         </div>
-        <span
-          className={cn(
-            "text-xs px-2 py-1 rounded-full whitespace-nowrap",
-            project?.indexingStatus === "COMPLETED"
-              ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-              : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+        <div className="flex shrink-0 items-center gap-2">
+          {messages.length > 0 && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={isLoading}
+              onClick={clearChat}
+              title="Clear chat"
+              className="text-gray-500 hover:text-red-500"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
           )}
-        >
-          {project?.indexingStatus || "…"}
-        </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={reindexMutation.isPending || !projectId}
+            onClick={() => reindexMutation.mutate()}
+          >
+            {reindexMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Reindex"}
+          </Button>
+          {indexingStatus && (
+            <span
+              className={cn(
+                "whitespace-nowrap rounded-full px-2 py-1 text-xs",
+                indexingStatus === "COMPLETED"
+                  ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                  : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              )}
+            >
+              {indexingStatus}
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* Chat Area */}
-      <ScrollArea className="flex-grow p-6 max-w-5xl mx-auto w-full">
-        <div className="space-y-6">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-6 sm:px-6">
           {messages.length === 0 && !isLoading && (
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.5 }}
-              className="text-center py-12"
+              transition={{ duration: 0.4 }}
+              className="py-10 text-center"
             >
-              <Image src="/logo.png" alt="GitBuddy" width={80} height={80} className="mx-auto mb-4 opacity-70" />
-              <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">
+              <Image src="/logo.png" alt="GitBuddy" width={72} height={72} className="mx-auto mb-4 opacity-70" />
+              <h2 className="mb-2 text-2xl font-semibold text-gray-800 dark:text-gray-100">
                 Ask about{" "}
-                <span className="text-transparent bg-clip-text bg-gradient-to-r from-orange-500 to-pink-500">
+                <span className="bg-gradient-to-r from-orange-500 to-pink-500 bg-clip-text text-transparent">
                   {project?.name || "this project"}
                 </span>
               </h2>
-              <p className="text-gray-500 dark:text-gray-400 max-w-lg mx-auto">
-                {project?.githubUrl
-                  ? `Connected to ${project.githubUrl.replace("https://github.com/", "")}. Ask anything about this repo.`
-                  : "Ask questions about your codebase and get detailed answers with code references."}
+              <p className="mx-auto mb-6 max-w-lg text-gray-500 dark:text-gray-400">
+                Ask anything about this repo and get answers with code references.
               </p>
+              <div className="flex flex-wrap justify-center gap-2">
+                {SUGGESTIONS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => ask(s)}
+                    className="rounded-full border border-orange-200 dark:border-orange-900/60 bg-white dark:bg-gray-800 px-4 py-2 text-sm text-gray-700 dark:text-gray-200 hover:border-orange-400 hover:text-orange-500 transition-colors"
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
             </motion.div>
           )}
 
-          {messages.map((message) => (
-            <motion.div
-              key={message.id}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.3 }}
-              className={cn(
-                "flex gap-3",
-                message.type === "question" ? "justify-end" : "justify-start",
-              )}
-            >
-              {message.type === "answer" && (
-                <div className="w-10 h-10 rounded-full bg-orange-100 dark:bg-orange-900 flex items-center justify-center flex-shrink-0">
-                  <Image src="/logo.png" alt="GitBuddy" width={24} height={24} />
-                </div>
-              )}
-              <div
-                className={cn(
-                  "p-4 rounded-2xl shadow-sm",
-                  message.type === "question"
-                    ? "bg-gradient-to-r from-orange-500 to-pink-500 text-white max-w-[80%]"
-                    : "bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-100 border border-gray-200 dark:border-gray-700 max-w-full",
-                )}
+          {messages.map((message) =>
+            message.type === "question" ? (
+              <motion.div
+                key={message.id}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2 }}
+                className="flex justify-end gap-3"
               >
-                {message.type === "question" ? (
-                  <p className="text-base leading-relaxed whitespace-pre-wrap">{message.content}</p>
-                ) : (
-                  <MemoizedMarkdown content={message.content} id={message.id} />
-                )}
-                <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                  {format(message.timestamp, "MMM d, h:mm a")}
+                <div className="min-w-0 max-w-[80%] rounded-2xl rounded-br-sm bg-gradient-to-r from-orange-500 to-pink-500 px-4 py-3 text-white shadow-sm">
+                  <p className="whitespace-pre-wrap break-words text-base leading-relaxed">{message.content}</p>
+                  <p className="mt-1 text-right text-xs text-white/70">{format(message.timestamp, "MMM d, h:mm a")}</p>
                 </div>
-                {message.type === "answer" && message.filesReferences && message.filesReferences.length > 0 && (
-                  <div className="mt-2">
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">
-                      {message.filesReferences.length} file reference{message.filesReferences.length > 1 ? "s" : ""}
-                    </p>
-                    <div className="flex flex-wrap gap-2">
-                      {message.filesReferences.map((file, index) => (
-                        <button
-                          key={index}
-                          onClick={() => openReference(file, message.filesReferences || [])}
-                          className="text-xs px-3 py-1 bg-orange-100 dark:bg-orange-900 text-gray-600 dark:text-gray-400 rounded-full hover:bg-orange-200 dark:hover:bg-orange-800 transition-colors"
-                        >
-                          {file.fileName} {file.score ? `(${file.score.toFixed(2)})` : ""}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-              {message.type === "question" && (
-                <div className="w-10 h-10 rounded-full bg-gray-200 dark:bg-gray-600 flex items-center justify-center flex-shrink-0">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gray-200 dark:bg-gray-600">
                   <span className="text-sm font-semibold text-gray-700 dark:text-gray-200">U</span>
                 </div>
-              )}
-            </motion.div>
-          ))}
+              </motion.div>
+            ) : (
+              <motion.div
+                key={message.id}
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2 }}
+                className="flex justify-start gap-3"
+              >
+                <BotAvatar />
+                <div
+                  className={cn(
+                    "min-w-0 max-w-[85%] overflow-hidden rounded-2xl rounded-bl-sm border px-4 py-3 shadow-sm",
+                    message.failed && !message.filesReferences?.length
+                      ? "border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100"
+                      : "border-gray-200 bg-white text-gray-800 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
+                  )}
+                >
+                  <div className="break-words">
+                    <MemoizedMarkdown content={message.content} id={message.id} />
+                  </div>
+                  <ReferenceChips
+                    references={message.filesReferences || []}
+                    onOpen={(file) => openReference(file, message.filesReferences || [])}
+                  />
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <p className="text-xs text-gray-500 dark:text-gray-400">{format(message.timestamp, "MMM d, h:mm a")}</p>
+                    {message.failed && message.question && (
+                      <button
+                        type="button"
+                        disabled={isLoading}
+                        onClick={() => retry(message.question!)}
+                        className="flex items-center gap-1 text-xs font-medium text-orange-600 dark:text-orange-400 hover:underline disabled:opacity-50"
+                      >
+                        <RotateCw className="h-3 w-3" />
+                        Retry
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )
+          )}
 
-          {isLoading && activeAnswer && (
+          {isLoading && (
             <motion.div
-              initial={{ opacity: 0, y: 10 }}
+              initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.3 }}
+              transition={{ duration: 0.2 }}
               className="flex justify-start gap-3"
             >
-              <div className="w-10 h-10 rounded-full bg-orange-100 dark:bg-orange-900 flex items-center justify-center flex-shrink-0">
-                <Image src="/logo.png" alt="GitBuddy" width={24} height={24} />
-              </div>
-              <div className="bg-white dark:bg-gray-800 p-4 rounded-2xl shadow-sm border border-gray-200 dark:border-gray-700 max-w-full">
-                <MemoizedMarkdown content={activeAnswer} id="streaming-answer" />
-                <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-                  {format(new Date(), "MMM d, h:mm a")}
-                </div>
-                {activeReferences.length > 0 && (
-                  <div className="mt-2">
-                    <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">
-                      {activeReferences.length} file reference{activeReferences.length > 1 ? "s" : ""}
-                    </p>
-                    <div className="flex flex-wrap gap-2">
-                      {activeReferences.map((file, index) => (
-                        <button
-                          key={index}
-                          onClick={() => openReference(file, activeReferences)}
-                          className="text-xs px-3 py-1 bg-orange-100 dark:bg-orange-900 text-gray-600 dark:text-gray-400 rounded-full hover:bg-orange-200 dark:hover:bg-orange-800 transition-colors"
-                        >
-                          {file.fileName} {file.score ? `(${file.score.toFixed(2)})` : ""}
-                        </button>
-                      ))}
-                    </div>
+              <BotAvatar />
+              <div className="min-w-0 max-w-[85%] overflow-hidden rounded-2xl rounded-bl-sm border border-gray-200 bg-white px-4 py-3 shadow-sm dark:border-gray-700 dark:bg-gray-800">
+                {activeAnswer ? (
+                  <div className="break-words">
+                    <MemoizedMarkdown content={activeAnswer} id="streaming-answer" />
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <Loader2 className="h-5 w-5 animate-spin text-orange-500" />
+                    <p className="text-sm text-gray-600 dark:text-gray-300">Searching the repo and writing an answer…</p>
                   </div>
                 )}
+                <ReferenceChips
+                  references={activeReferences}
+                  onOpen={(file) => openReference(file, activeReferences)}
+                />
               </div>
             </motion.div>
           )}
 
-          {isLoading && !activeAnswer && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.3 }}
-              className="flex justify-start gap-3"
-            >
-              <div className="w-10 h-10 rounded-full bg-orange-100 dark:bg-orange-900 flex items-center justify-center flex-shrink-0">
-                <Image src="/logo.png" alt="GitBuddy" width={24} height={24} />
+          {unanswered && (
+            <div className="flex justify-start gap-3">
+              <BotAvatar />
+              <div className="flex items-center gap-3 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-100">
+                This question didn&apos;t get an answer.
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMessages((prev) => prev.slice(0, -1));
+                    retry(unanswered.content);
+                  }}
+                  className="flex items-center gap-1 font-medium text-orange-600 dark:text-orange-400 hover:underline"
+                >
+                  <RotateCw className="h-3 w-3" />
+                  Retry
+                </button>
               </div>
-              <div className="bg-white dark:bg-gray-800 p-4 rounded-2xl">
-                <Loader2 className="w-5 h-5 animate-spin text-orange-500" />
-              </div>
-            </motion.div>
+            </div>
           )}
-          <div ref={messagesEndRef} />
         </div>
-      </ScrollArea>
+      </div>
 
-      {/* Input Area */}
-      <div className="p-4 bg-white dark:bg-gray-800 shadow-sm">
-        <form onSubmit={handleSubmit} className="max-w-5xl mx-auto flex gap-3 items-end">
+      <div className="border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-3 sm:p-4">
+        <form onSubmit={handleSubmit} className="mx-auto flex w-full max-w-4xl items-end gap-3">
           <Textarea
             ref={textareaRef}
-            placeholder="Ask about your codebase..."
+            placeholder={isLoading ? "Waiting for the answer…" : "Ask about your codebase… (Shift+Enter for a new line)"}
             value={question}
             onChange={(e) => setQuestion(e.target.value)}
-            className="flex-grow min-h-[60px] max-h-[150px] resize-none border-gray-300 dark:border-gray-600 focus:ring-2 focus:ring-orange-500 text-base shadow-sm rounded-xl placeholder:text-gray-500 dark:placeholder:text-gray-400 text-gray-800 dark:text-gray-200"
+            rows={1}
+            className="min-h-[52px] max-h-[150px] flex-grow resize-none rounded-xl border-gray-300 text-base text-gray-800 shadow-sm placeholder:text-gray-500 focus:ring-2 focus:ring-orange-500 dark:border-gray-600 dark:text-gray-200 dark:placeholder:text-gray-400"
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                handleSubmit(e as any);
+                handleSubmit();
               }
             }}
           />
           <Button
             type="submit"
             disabled={isLoading || !question.trim()}
-            className="bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 text-white font-semibold py-2 px-4 rounded-xl transition-all duration-200 shadow-sm disabled:from-orange-400 disabled:to-pink-400"
+            className="h-[52px] rounded-xl bg-gradient-to-r from-orange-500 to-pink-500 px-4 font-semibold text-white shadow-sm transition-all hover:from-orange-600 hover:to-pink-600 disabled:opacity-50"
           >
-            {isLoading ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
-              <Send className="w-5 h-5" />
-            )}
+            {isLoading ? <Loader2 className="h-5 w-5 animate-spin" /> : <Send className="h-5 w-5" />}
           </Button>
         </form>
       </div>
 
-      {/* Sliding Code Reference Panel */}
       <AnimatePresence>
         {selectedReference && (
           <motion.div
@@ -425,11 +550,11 @@ export default function QA() {
             transition={{ duration: 0.3, ease: "easeInOut" }}
             onClick={closeReference}
           >
-            <CodeReferencePanel 
-              file={selectedReference} 
+            <CodeReferencePanel
+              file={selectedReference}
               allReferences={currentReferenceFiles}
               onClose={closeReference}
-              onChangeReference={changeReference}
+              onChangeReference={setSelectedReference}
             />
           </motion.div>
         )}

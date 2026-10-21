@@ -13,6 +13,13 @@ import { summariseCode_2 } from './gemini2';
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
+function textForEmbedding(fileName: string, summary: string, source: string) {
+  if (/could not be determined due to an error/i.test(summary)) {
+    return `File: ${fileName}\n${source.slice(0, 8000)}`;
+  }
+  return summary;
+}
+
 
 // Parse GitHub URL to extract owner and repo
 async function RepoDetails(githubUrl: string) {
@@ -251,7 +258,9 @@ export const RepoGenerateEmbeddings = async (
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
             const summary = await summariseCode(doc);
-            const embedding = await generateEmbedding(summary);
+            const embedding = await generateEmbedding(
+              textForEmbedding(doc.metadata.source || "unknown file", summary, doc.pageContent)
+            );
             const result: EmbeddingResult = {
               summary,
               embedding,
@@ -289,7 +298,9 @@ export const RepoGenerateEmbeddings = async (
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
           try {
             const summary = await summariseCode_2(doc);
-            const embedding = await generateEmbedding(summary);
+            const embedding = await generateEmbedding(
+              textForEmbedding(doc.metadata.source || "unknown file", summary, doc.pageContent)
+            );
             const result: EmbeddingResult = {
               summary,
               embedding,

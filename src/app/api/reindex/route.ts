@@ -27,6 +27,11 @@ export async function GET(req: NextRequest) {
 
     const results = await RepoGenerateEmbeddings(projectId);
 
+    await prisma.project.update({
+      where: { id: projectId },
+      data: { indexingStatus: "COMPLETED" },
+    });
+
     return NextResponse.json({
       message: "Reindex complete",
       projectId,
