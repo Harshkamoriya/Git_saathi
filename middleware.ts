@@ -9,6 +9,14 @@ export function middleware(request: NextRequest) {
 
   const protectedRoutes = ["/project", "/projects"];
 
+  if (request.nextUrl.pathname.startsWith("/join")) {
+    if (!sessionToken) {
+      const login = new URL("/login", request.url);
+      login.searchParams.set("callbackUrl", request.nextUrl.pathname);
+      return NextResponse.redirect(login);
+    }
+  }
+
   if (protectedRoutes.some((route) => request.nextUrl.pathname.startsWith(route))) {
     if (!sessionToken) {
       return NextResponse.redirect(new URL("/login", request.url));
@@ -19,5 +27,5 @@ export function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/modules/:path*", "/project/:path*"],
+  matcher: ["/modules/:path*", "/project/:path*", "/join/:path*"],
 };

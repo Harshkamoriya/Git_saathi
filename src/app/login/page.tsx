@@ -15,10 +15,13 @@ export default function LoginForm() {
 
   const handleOAuthSignIn = async (provider: "github" | "google") => {
    {provider === "google" ? setIsLoadingGoogle(true) : setIsLoading(true)}
+    const requested = new URLSearchParams(window.location.search).get("callbackUrl");
+    const callbackUrl =
+      requested && requested.startsWith("/") && !requested.startsWith("//") && !requested.includes("\\") && !requested.includes("://")
+        ? requested
+        : "/create";
     try {
-      await signIn(provider, {
-        callbackUrl: "/create", // Redirect after successful login
-      });
+      await signIn(provider, { callbackUrl });
     } catch (error) {
       console.error("OAuth sign-in error:", error);
     } finally {

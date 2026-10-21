@@ -50,7 +50,8 @@ model User {
   sessions      Session[]
   credits       Int       @default(200)
 
-  projects      UserToProject[]    
+  projects      UserToProject[]
+  invitesCreated Invite[]
 }
 
 model Project {
@@ -65,6 +66,7 @@ model Project {
   commits     Commit[]
   users       UserToProject[]    
   meetings    Meeting[]
+  invites     Invite[]
 }
 
 model UserToProject {
@@ -80,6 +82,23 @@ model UserToProject {
 
   @@unique([userId, projectId])
   @@index([userId])
+  @@index([projectId])
+}
+
+model Invite {
+  id          String    @id @default(cuid())
+  token       String    @unique
+  projectId   String
+  createdById String
+  expiresAt   DateTime
+  maxUses     Int       @default(10)
+  useCount    Int       @default(0)
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  project     Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy   User      @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
   @@index([projectId])
 }
 

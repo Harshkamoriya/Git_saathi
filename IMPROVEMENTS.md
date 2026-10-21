@@ -24,7 +24,7 @@ Create project
 - [ ] **Clear the Pinecone namespace before reindex** — deleted files leave stale vectors.
 
 Projects list
-- [ ] **Owner / roles column** — "owner" is currently the earliest `UserToProject` row; add `role` (OWNER / MEMBER) to `UserToProject` or `ownerId` to `Project`.
+- [ ] **Owner / roles column** — "owner" is currently the earliest `UserToProject` row; add `role` (OWNER / MEMBER) to `UserToProject` or `ownerId` to `Project`. Invites already use that earliest-member rule. There is still no way for the owner to remove another member.
 - [ ] **Restore archived projects** — archive is a soft delete (`deletedAt`) with no UI to view or restore archived projects.
 
 Auth (do with the Login feature)
@@ -300,17 +300,9 @@ Still open: shared cache, in-app comments, and a per-PR summary (see Open issues
 
 ## 4j. Join Project (invites)
 
-- **Invite = projectId**
-  - Today: `{origin}/join/{projectId}`; no expiry, no revoke, no owner approval; projectId appears in every project URL, so anyone who sees one can join.
-  - Better: `Invite` table with random token, expiry, max uses, created-by; join validates the token, not the projectId.
+Fixed in the Oct 21 pass: invites are random tokens (7 days, 10 uses, owner can revoke) instead of the project id; only the creator can make or revoke a link; signed-out visitors go to `/login` and come back to the same invite.
 
-- **No roles**
-  - Today: all members equal; nobody can remove a member.
-  - Better: `role` on `UserToProject` (OWNER / MEMBER); only OWNER can invite, remove, delete, reindex.
-
-- **Wrong login redirect**
-  - Today: join page redirects unauthenticated users to `/auth/signin`, but the app's sign-in page is `/login` → 404.
-  - Better: `signIn(undefined, { callbackUrl: "/join/<id>" })` so they come back to the invite after login.
+Still open: a real OWNER / MEMBER column. "Owner" is still the earliest `UserToProject` row, and members can't be removed by the owner (see Open issues).
 
 ## 4k. Reindex
 

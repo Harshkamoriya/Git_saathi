@@ -58,7 +58,7 @@ const DashBoardPage = ({ params }: { params: Promise<{ projectId: string }> }) =
 
         <div className="flex items-center gap-4">
           <TeamMembers projectId={projectId} />
-          <InviteButton projectId={projectId} />
+          {session?.user?.id && project.users[0]?.user.id === session.user.id ? <InviteButton projectId={projectId} /> : null}
         </div>
       </div>
 
