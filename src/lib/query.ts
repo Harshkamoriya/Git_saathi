@@ -2,72 +2,71 @@
 
 import { prisma } from "./db";
 import { getAuthSession } from "./auth";
-import { checkCreditsAndStructure, RepoGenerateEmbeddings } from "./githubLoader";
+import { checkCreditsAndStructure } from "./githubLoader";
+import { runIndexing } from "./indexing";
 import { redirect } from "next/navigation";
+import { after } from "next/server";
+
+type CreateProjectResult =
+  | { ok: true; project: { id: string; name: string; githubUrl: string | null; indexingStatus: string }; fileCount: number }
+  | { ok: false; error: string };
+
+const MAX_PROJECT_NAME = 80;
 
 
-export async function CreateProject(githubUrl: string, name: string) {
+export async function CreateProject(githubUrl: string, name: string): Promise<CreateProjectResult> {
   const session = await getAuthSession();
   const userId = session?.user?.id;
-  if (!session) redirect("/login");
+  if (!userId) return { ok: false, error: "Please sign in again." };
 
-  if (!userId) throw new Error("Unauthorized");
-  if (!name?.trim()) throw new Error("Project name is required");
-
-  // Credit check before any DB writes
-  const { fileCount, userCredits } = await checkCreditsAndStructure(githubUrl);
-  if (fileCount > userCredits) {
-    throw new Error("Insufficient credits");
+  const projectName = name?.trim() ?? "";
+  if (!projectName) return { ok: false, error: "Project name is required." };
+  if (projectName.length > MAX_PROJECT_NAME) {
+    return { ok: false, error: `Project name must be ${MAX_PROJECT_NAME} characters or fewer.` };
   }
 
-  // Create project + membership first so a later indexing failure does not
-  // leave the UI saying "failed" while the project already exists.
-  const project = await prisma.project.create({
-    data: {
-      name: name.trim(),
-      githubUrl,
-      indexingStatus: "INDEXING",
-    },
-  });
+  // Recount on the server; never trust a count sent from the browser
+  const check = await checkCreditsAndStructure(githubUrl);
+  if (!check.ok) return check;
+  if (check.alreadyAdded) return { ok: false, error: "You've already added this repository as a project." };
 
-  await prisma.userToProject.create({
-    data: {
-      userId,
-      projectId: project.id,
-    },
-  });
+  const { fileCount } = check;
 
-  await prisma.user.update({
-    where: { id: userId },
-    data: { credits: { decrement: fileCount } },
-  });
-
+  let project: { id: string; name: string; githubUrl: string | null; indexingStatus: string };
   try {
-    await RepoGenerateEmbeddings(project.id);
-    await prisma.project.update({
-      where: { id: project.id },
-      data: { indexingStatus: "COMPLETED" },
+    project = await prisma.$transaction(async (tx) => {
+      // Conditional decrement so two tabs can't both spend the same credits
+      const charged = await tx.user.updateMany({
+        where: { id: userId, credits: { gte: fileCount } },
+        data: { credits: { decrement: fileCount } },
+      });
+      if (charged.count === 0) throw new Error("INSUFFICIENT_CREDITS");
+
+      return tx.project.create({
+        data: {
+          name: projectName,
+          githubUrl: check.githubUrl,
+          indexingStatus: "INDEXING",
+          users: { create: { userId } },
+        },
+        select: { id: true, name: true, githubUrl: true, indexingStatus: true },
+      });
     });
-    return {
-      project: { ...project, indexingStatus: "COMPLETED" },
-      message: "Project created and indexed successfully",
-      indexingFailed: false,
-    };
   } catch (error) {
-    console.error("Project created but indexing failed:", error);
-    await prisma.project.update({
-      where: { id: project.id },
-      data: { indexingStatus: "FAILED" },
-    });
-    // Still return success — project exists and user can open / reindex it
-    return {
-      project: { ...project, indexingStatus: "FAILED" },
-      message:
-        "Project created, but indexing failed. Open the project and reindex from Ask me.",
-      indexingFailed: true,
-      indexingError: (error as Error).message,
-    };
+    if ((error as Error).message === "INSUFFICIENT_CREDITS") {
+      return {
+        ok: false,
+        error: `This repo needs ${fileCount} credits and you have ${check.userCredits}.`,
+      };
+    }
+    console.error("CreateProject failed:", error);
+    return { ok: false, error: "Couldn't create the project. Please try again." };
   }
+
+  // Index after the response is sent, so the user isn't stuck waiting on the create screen
+  after(() => runIndexing(project.id, { userId, credits: fileCount }));
+
+  return { ok: true, project, fileCount };
 }
 
 export async function GetProjects() {

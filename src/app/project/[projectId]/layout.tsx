@@ -17,6 +17,7 @@ import { Button } from '@/components/ui/button';
 
 import { ModeToggle } from '@/components/mode-toggle';
 import { AppSidebar } from '@/components/app-sidebar';
+import IndexingBanner from '@/components/indexing-banner';
 type Props = {
   children: React.ReactNode;
 };
@@ -116,6 +117,7 @@ const SidebarLayout = ({ children }: Props) => {
           </header>
 
           <main className="flex-1 overflow-auto p-6">
+            <IndexingBanner />
             <div className="rounded-xl border border-orange-200 dark:border-orange-900/50 bg-white dark:bg-gray-800 shadow-sm transition-all duration-300 hover:shadow-md">
               {children}
             </div>

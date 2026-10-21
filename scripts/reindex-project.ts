@@ -2,7 +2,7 @@ import "dotenv/config";
 import { config } from "dotenv";
 config({ path: ".env.local" });
 
-import { RepoGenerateEmbeddings } from "../src/lib/githubLoader";
+import { runIndexing } from "../src/lib/indexing";
 import { prisma } from "../src/lib/db";
 
 const projectId = process.argv[2];
@@ -19,13 +19,8 @@ async function main() {
   if (!project) throw new Error(`Project not found: ${projectId}`);
 
   console.log("Reindexing project:", project);
-  await prisma.project.update({
-    where: { id: projectId },
-    data: { indexingStatus: "INDEXING" },
-  });
-
-  const results = await RepoGenerateEmbeddings(projectId);
-  console.log(`Done. Embedded ${results.length} files.`);
+  const indexed = await runIndexing(projectId);
+  console.log(`Done. Embedded ${indexed} files.`);
 
   const updated = await prisma.project.findUnique({
     where: { id: projectId },

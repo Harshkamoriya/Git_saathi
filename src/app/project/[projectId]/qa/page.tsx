@@ -132,12 +132,12 @@ export default function QA() {
       const res = await fetch(`/api/reindex?projectId=${projectId}`);
       const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error("Reindex failed. Please try again in a minute.");
+        throw new Error(body.error || "Couldn't start reindexing. Please try again.");
       }
       return body;
     },
     onSuccess: () => {
-      toast.success("Reindex finished. Ask again for a sharper answer.");
+      toast.success("Reindexing started. Ask me will be ready again in a few minutes.");
       queryClient.invalidateQueries({ queryKey: ["project", projectId] });
     },
     onError: (error: Error) => toast.error(error.message),
@@ -352,7 +352,7 @@ export default function QA() {
             type="button"
             variant="outline"
             size="sm"
-            disabled={reindexMutation.isPending || !projectId}
+            disabled={reindexMutation.isPending || !projectId || project?.indexingStatus === "INDEXING"}
             onClick={() => reindexMutation.mutate()}
           >
             {reindexMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Reindex"}
