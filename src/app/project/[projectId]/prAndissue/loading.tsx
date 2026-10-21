@@ -3,8 +3,8 @@ import React from "react";
 
 export default function Loading() {
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
-      <div className="max-w-6xl mx-auto py-6 px-4">
+    <div className="p-2">
+      <div className="max-w-6xl mx-auto">
         {/* Header Skeleton */}
         <div className="mb-6">
           <Skeleton className="h-8 w-1/4 mb-2" />

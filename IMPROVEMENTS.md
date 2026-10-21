@@ -30,6 +30,16 @@ Projects list
 Auth (do with the Login feature)
 - [ ] **`/create`, `/projects`, `/billing`, `/join` load without a session** — add them to the middleware matcher and redirect in `(protected)/layout.tsx`; server actions already refuse, so this is a UX gate.
 
+Analytics
+- [ ] **Shared analytics cache** — results are cached in memory for 1 hour on this server; move the cache to Redis so every instance shares it.
+- [ ] **Repo health summary** — optional short LLM paragraph (activity change, stale PRs). Left out so opening analytics does not spend a Gemini call.
+- [ ] **Commit stats are the default branch** — contributor lines and the weekday chart use GitHub's stats API, which follows the default branch, not every branch.
+
+Pull requests and issues
+- [ ] **Shared list cache** — pull requests and issues are cached in memory for 5 minutes on this server; move the cache to Redis so every instance shares it.
+- [ ] **Comment, close, or review in the app** — needs the logged-in user's GitHub token. The page links out to GitHub instead.
+- [ ] **AI summary of a pull request** — left out so the list does not spend a Gemini call per row.
+
 Ask me
 - [ ] **Verify Gemini model IDs on the real key** — answers try `gemini-3.5-flash-lite` → `gemini-3.8-flash` → `gemini-3.6-flash`; not smoke-tested against the project's API key.
 - [ ] **Stream tokens again** — answers are generated in one call and sent at once (streaming was hanging); bring back streaming with a timeout once the SDK path is reliable.
@@ -263,42 +273,15 @@ Ask me
 
 ## 4g. Analytics
 
-- **Too many GitHub API calls, no cache**
-  - Today: every page load paginates all commits, then up to 50 `getCommit` calls per author (sequential per author) + 10 more for key commits + issues/PRs/branches/tree. A 1000-commit, 10-author repo ≈ 500+ calls → tens of seconds, burns the 5000/hr limit.
-  - Better: cache results in DB/Redis with a TTL (e.g. 1h) or refresh via background job/webhook; use GitHub's `stats/contributors` endpoint (per-author weekly additions/deletions in one call) instead of per-commit `getCommit`.
+Fixed in the Oct 21 pass: membership check, GitHub stats endpoints instead of per-commit fetches, 1h in-memory cache, 202 retry, contributors grouped by login, PR cycle time is merged-only, recent commits show line counts instead of an impact score, responsive charts, friendly errors.
 
-- **Code frequency 202 not handled**
-  - Today: GitHub stats endpoints return 202 while computing → empty array → empty chart on first visit.
-  - Better: retry after a few seconds when status is 202.
-
-- **Contributors grouped by git author name**
-  - Today: same person with different git names/emails is split; lines counted only from first 50 commits per author but shown like totals.
-  - Better: group by GitHub `author.login` (fallback email); use stats/contributors for real totals.
-
-- **Misleading metrics**
-  - "Avg PR review time" = open → closed (includes unmerged); rename to "PR cycle time" or compute merged-only / first-review time.
-  - `impactScore` weights are arbitrary (message length counts); only picks from the latest 10 commits. Explain it as a heuristic, or base it on lines/files across a time window.
-
-- **No AI in "insights"**
-  - Option: LLM summary of repo health ("activity dropped 40% this month, 3 PRs stale >14 days").
+Still open: shared cache, optional health summary, default-branch limit on stats (see Open issues).
 
 ## 4h. PR & Issues
 
-- **Fetches everything at once**
-  - Today: paginates all PRs and issues (state all) on every visit; filter/sort client-side.
-  - Better: server-side pagination + filter (`state`, `page`), or GitHub search API; cache.
+Fixed in the Oct 21 pass: membership check, GitHub search for one page at a time (cached 5 minutes), merged vs closed, links out to GitHub, friendly errors, and the same close-time / cycle-time sample as analytics.
 
-- **Merged vs closed not separated**
-  - Today: merged PRs show as `closed`.
-  - Better: use `merged_at` → states Open / Merged / Closed.
-
-- **Read-only**
-  - Option: link out per item, comment/close actions with the user's own OAuth token; AI summary of a PR (diff → summary, reusing the commit prompt).
-
-- **Duplicate logic**
-  - `getRepoStatus` and `PRandIssues` both fetch issues/PRs and compute the same averages → extract shared helpers.
-
-- **No auth check** on `getRepoStatus` / `PRandIssues` (same membership fix as other project actions).
+Still open: shared cache, in-app comments, and a per-PR summary (see Open issues).
 
 ---
 

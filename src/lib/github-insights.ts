@@ -2,315 +2,492 @@
 
 import { Octokit } from "octokit";
 import { prisma } from "./db";
+import { getAuthSession } from "./auth";
+import { parseGithubUrl } from "./repoRules";
+import {
+  averageDays,
+  countFromLink,
+  normalizeWorkQuery,
+  shapeActivity,
+  shapeCodeFrequency,
+  shapeContributors,
+  shapeLanguages,
+  shapeWorkItem,
+  summarizeFileTypes,
+  workSearchOrder,
+  workSearchQuery,
+  type CodeWeek,
+  type ContributorRow,
+  type DayCount,
+  type FileTypeShare,
+  type LanguageShare,
+  type WeekdayCount,
+  type WorkItem,
+  type WorkKind,
+  type WorkSort,
+  type WorkState,
+} from "./repoAnalytics";
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
 
-// Interfaces (simplified for PRs and Issues)
-interface PullRequest {
-  number: number;
-  title: string;
-  state: string;
-  createdAt: string;
-  updatedAt: string;
-  author: string;
-  reviewers: string[];
-}
+const CACHE_TTL_MS = 60 * 60 * 1000;
+const PENDING_TTL_MS = 20_000;
+const MAX_CACHE_ENTRIES = 50;
+const FETCH_TIMEOUT_MS = 30_000;
+const STATS_ATTEMPTS = 3;
+const SHOWN_CONTRIBUTORS = 24;
 
-interface Issue {
-  number: number;
-  title: string;
-  state: string;
-  createdAt: string;
-  updatedAt: string;
-  author: string;
-  labels: string[];
-}
-
-interface RepoInfo {
-  owner: string;
-  repo: string;
-}
-
-interface RepoStatus {
+export interface RepoAnalytics {
   name: string;
   description: string;
+  htmlUrl: string;
+  defaultBranch: string;
+  fetchedAt: string;
   totalCommits: number;
   totalContributors: number;
-  codeFrequency: { weekStart: string; additions: number; deletions: number }[];
-  contributors: { author: string; commits: number; linesAdded: number; linesDeleted: number; avatar?: string }[];
-  openIssues: number;
-  branches: string[];
-  pullRequests: PullRequest[];
-  issues: Issue[];
-  fileTypes: { extension: string; count: number; percentage: number }[];
+  contributors: ContributorRow[];
+  openIssues: number | null;
+  openPullRequests: number;
+  branchCount: number;
   stargazers: number;
   forks: number;
-  languages: Record<string, number>;
-  keyCommits: { message: string; author: string; date: string; sha: string; impactScore: number }[];
-  averageIssueResolutionTime: number;
-  averagePRReviewTime: number;
-  commitFrequency: { day: string; count: number }[];
-  commitsPerDay: { date: string; count: number }[];
+  languages: LanguageShare[];
+  fileTypes: FileTypeShare[];
+  fileTypesTruncated: boolean;
+  commitsPerDay: DayCount[];
+  commitFrequency: WeekdayCount[];
+  codeFrequency: CodeWeek[];
+  recentCommits: {
+    message: string;
+    author: string;
+    date: string;
+    sha: string;
+    url: string;
+    additions: number;
+    deletions: number;
+    filesChanged: number;
+  }[];
+  averageIssueResolutionTime: number | null;
+  issueSampleSize: number;
+  averagePrCycleTime: number | null;
+  prSampleSize: number;
+  statsPending: boolean;
 }
 
-const parseRepoUrl = (githubUrl: string): RepoInfo => {
-  const cleanUrl = githubUrl.replace(/\.git\/?$/, "").replace(/\/$/, "");
-  const parts = cleanUrl.split("/").filter(Boolean).slice(-2);
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
-    throw new Error("Invalid GitHub URL");
-  }
-  return { owner: parts[0], repo: parts[1] };
-};
+export type AnalyticsResult = { ok: true; data: RepoAnalytics } | { ok: false; error: string };
 
-// Full repo status (unchanged except for PRs and Issues extraction)
-export const getRepoStatus = async (projectId: string): Promise<RepoStatus> => {
-  console.log(`Fetching repo status for project ${projectId}`);
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { githubUrl: true },
+const insightsCache = new Map<string, { at: number; ttl: number; data: RepoAnalytics }>();
+const inflight = new Map<string, Promise<RepoAnalytics>>();
+const WORK_CACHE_TTL_MS = 5 * 60 * 1000;
+const SUMMARY_TTL_MS = 10 * 60 * 1000;
+const WORK_PER_PAGE = 20;
+const workCache = new Map<string, { at: number; data: WorkList }>();
+const summaryCache = new Map<string, { at: number; data: WorkSummary }>();
+const workInflight = new Map<string, Promise<WorkList>>();
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function remember(projectId: string, data: RepoAnalytics) {
+  if (insightsCache.size >= MAX_CACHE_ENTRIES) insightsCache.delete(insightsCache.keys().next().value!);
+  insightsCache.set(projectId, {
+    at: Date.now(),
+    ttl: data.statsPending ? PENDING_TTL_MS : CACHE_TTL_MS,
+    data,
   });
+}
 
-  if (!project?.githubUrl) {
-    throw new Error("Project not found or GitHub URL missing");
+function readCache(projectId: string) {
+  const hit = insightsCache.get(projectId);
+  if (!hit) return null;
+  if (Date.now() - hit.at > hit.ttl) {
+    insightsCache.delete(projectId);
+    return null;
   }
+  return hit.data;
+}
 
-  const { owner, repo } = parseRepoUrl(project.githubUrl);
+function linkHeader(headers: object) {
+  const link = (headers as { link?: string }).link;
+  return typeof link === "string" ? link : undefined;
+}
 
+function analyticsErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message === "timeout") {
+    return "GitHub is taking too long. Please try again.";
+  }
+  const status = (error as { status?: number })?.status;
+  if (status === 404) return "Repository not found, or the server's GitHub token can't see it.";
+  if (status === 403 || status === 429) return "GitHub rate limit reached. Please wait a few minutes and try again.";
+  if (status === 401) return "The server's GitHub token is invalid.";
+  return "Couldn't load analytics right now. Please try again.";
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timeout")), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/** GitHub stats endpoints answer 202 while they compute, then 200. */
+async function readStats(request: () => Promise<{ status: number; data?: unknown }>) {
+  for (let attempt = 0; attempt < STATS_ATTEMPTS; attempt++) {
+    const response = await request();
+    if (response.status === 200) return { data: response.data ?? null, pending: false };
+    if (response.status !== 202 || attempt === STATS_ATTEMPTS - 1) {
+      return { data: null, pending: response.status === 202 };
+    }
+    await delay(1500);
+  }
+  return { data: null, pending: true };
+}
+
+async function quietly<T>(label: string, fallback: T, request: () => Promise<T>): Promise<T> {
   try {
-    const { data: repoData } = await octokit.rest.repos.get({ owner, repo });
-    const allCommits = await octokit.paginate(octokit.rest.repos.listCommits, { owner, repo, per_page: 100 });
+    return await request();
+  } catch (error) {
+    console.error(`github ${label} failed:`, (error as Error).message);
+    return fallback;
+  }
+}
 
-    // Commits per day (unchanged)
-    const commitsPerDayMap = new Map<string, number>();
-    allCommits.forEach((c) => {
-      const date = new Date(c.commit.author?.date || c.commit.committer?.date || Date.now())
-        .toISOString()
-        .split("T")[0]!;
-      commitsPerDayMap.set(date, (commitsPerDayMap.get(date) || 0) + 1);
-    });
-    const commitsPerDay = Array.from(commitsPerDayMap.entries())
-      .map(([date, count]) => ({ date, count }))
-      .sort((a, b) => a.date.localeCompare(b.date));
+async function commitCount(owner: string, repo: string) {
+  try {
+    const response = await octokit.rest.repos.listCommits({ owner, repo, per_page: 1 });
+    return countFromLink(linkHeader(response.headers), response.data.length);
+  } catch (error) {
+    const status = (error as { status?: number }).status;
+    if (status === 409) return 0;
+    throw error;
+  }
+}
 
-    const uniqueContributors = [...new Set(allCommits.map((c) => c.commit.author?.name || "Unknown"))];
-    const contributorStats = await Promise.all(
-      uniqueContributors.map(async (author) => {
-        const authorCommits = allCommits.filter((c) => c.commit.author?.name === author);
-        let linesAdded = 0,
-          linesDeleted = 0;
-        for (const commit of authorCommits.slice(0, 50)) {
-          const { data } = await octokit.rest.repos.getCommit({ owner, repo, ref: commit.sha });
-          data.files?.forEach((f) => {
-            linesAdded += f.additions || 0;
-            linesDeleted += f.deletions || 0;
-          });
+async function branchCount(owner: string, repo: string) {
+  const response = await octokit.rest.repos.listBranches({ owner, repo, per_page: 1 });
+  return countFromLink(linkHeader(response.headers), response.data.length);
+}
+
+async function openIssueCount(owner: string, repo: string) {
+  const { data } = await octokit.request("GET /search/issues", {
+    q: `repo:${owner}/${repo} is:issue is:open`,
+    per_page: 1,
+  });
+  return data.total_count;
+}
+
+async function openPullCount(owner: string, repo: string) {
+  const response = await octokit.rest.pulls.list({ owner, repo, state: "open", per_page: 1 });
+  return countFromLink(linkHeader(response.headers), response.data.length);
+}
+
+async function issueResolution(owner: string, repo: string) {
+  const { data } = await octokit.rest.issues.listForRepo({ owner, repo, state: "closed", per_page: 100 });
+  return averageDays(
+    data
+      .filter((issue) => !issue.pull_request && issue.closed_at)
+      .map((issue) => ({ start: issue.created_at, end: issue.closed_at! }))
+  );
+}
+
+async function prCycle(owner: string, repo: string) {
+  const { data } = await octokit.rest.pulls.list({ owner, repo, state: "closed", per_page: 100 });
+  return averageDays(
+    data.filter((pr) => pr.merged_at).map((pr) => ({ start: pr.created_at, end: pr.merged_at! }))
+  );
+}
+
+async function recentCommits(owner: string, repo: string) {
+  try {
+    const { data } = await octokit.rest.repos.listCommits({ owner, repo, per_page: 5 });
+    const detailed = await Promise.all(
+      data.map(async (commit) => {
+        let additions = 0;
+        let deletions = 0;
+        let filesChanged = 0;
+        try {
+          const full = await octokit.rest.repos.getCommit({ owner, repo, ref: commit.sha });
+          additions = full.data.stats?.additions ?? 0;
+          deletions = full.data.stats?.deletions ?? 0;
+          filesChanged = full.data.files?.length ?? 0;
+        } catch (error) {
+          console.error("analytics commit detail failed:", (error as Error).message);
         }
         return {
-          author,
-          commits: authorCommits.length,
-          linesAdded,
-          linesDeleted,
-          avatar: authorCommits[0]?.author?.avatar_url,
-        };
-      })
-    );
-
-    const { data: codeFreqData } = await octokit.rest.repos.getCodeFrequencyStats({ owner, repo });
-    const codeFrequency = (Array.isArray(codeFreqData) ? codeFreqData : []).map((w) => ({
-      weekStart: w[0] ? new Date(w[0] * 1000).toISOString().split("T")[0]! : "",
-      additions: w[1] || 0,
-      deletions: w[2] || 0,
-    }));
-
-    const issues = await octokit.paginate(octokit.rest.issues.listForRepo, { owner, repo, state: "all", per_page: 100 });
-    const pulls = await octokit.paginate(octokit.rest.pulls.list, { owner, repo, state: "all", per_page: 100 });
-    const branches = await octokit.paginate(octokit.rest.repos.listBranches, { owner, repo, per_page: 100 });
-    const { data: languages } = await octokit.rest.repos.listLanguages({ owner, repo });
-    const { data: treeData } = await octokit.rest.git.getTree({
-      owner,
-      repo,
-      tree_sha: allCommits[0]?.commit.tree.sha || "HEAD",
-      recursive: "true",
-    });
-
-    const fileExtensions = new Map<string, number>();
-    treeData.tree.forEach((item: any) => {
-      if (item.type === "blob") {
-        const extension = item.path.split(".").pop() || "none";
-        fileExtensions.set(extension, (fileExtensions.get(extension) || 0) + 1);
-      }
-    });
-    const totalFiles = Array.from(fileExtensions.values()).reduce((sum, count) => sum + count, 0);
-    const fileTypes = Array.from(fileExtensions.entries()).map(([extension, count]) => ({
-      extension,
-      count,
-      percentage: totalFiles ? Math.round((count / totalFiles) * 100 * 10) / 10 : 0,
-    }));
-
-    const closedIssues = issues.filter((i) => i.state === "closed" && !i.pull_request);
-    const issueResolutionTime = closedIssues.reduce((sum, issue) => {
-      const created = new Date(issue.created_at).getTime();
-      const closed = new Date(issue.closed_at || issue.updated_at).getTime();
-      return sum + (closed - created) / (1000 * 60 * 60 * 24);
-    }, 0);
-    const averageIssueResolutionTime = closedIssues.length ? Math.round((issueResolutionTime / closedIssues.length) * 10) / 10 : 0;
-
-    const closedPRs = pulls.filter((pr) => pr.state === "closed" && pr.closed_at);
-    const prReviewTime = closedPRs.reduce((sum, pr) => {
-      const created = new Date(pr.created_at).getTime();
-      const closed = new Date(pr.closed_at!).getTime();
-      return sum + (closed - created) / (1000 * 60 * 60 * 24);
-    }, 0);
-    const averagePRReviewTime = closedPRs.length ? Math.round((prReviewTime / closedPRs.length) * 10) / 10 : 0;
-
-    const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
-    const commitFrequencyMap = new Map<string, number>(days.map((d) => [d, 0]));
-    allCommits.forEach((c) => {
-      const day = days[new Date(c.commit.author?.date || c.commit.committer?.date || Date.now()).getDay()];
-      commitFrequencyMap.set(day, (commitFrequencyMap.get(day) || 0) + 1);
-    });
-    const commitFrequency = Array.from(commitFrequencyMap.entries()).map(([day, count]) => ({ day, count }));
-
-    const keyCommits = await Promise.all(
-      allCommits.slice(0, 10).map(async (commit) => {
-        const { data: commitData } = await octokit.rest.repos.getCommit({ owner, repo, ref: commit.sha });
-        const messageLength = commit.commit.message.length;
-        const filesChanged = commitData.files?.length || 0;
-        const additions = commitData.stats?.additions || 0;
-        const deletions = commitData.stats?.deletions || 0;
-        const impactScore = Math.round((messageLength * 0.01 + filesChanged * 0.5 + additions * 0.01 + deletions * 0.01) * 10) / 10;
-
-        return {
-          message: commit.commit.message.split("\n")[0] || "No message",
-          author: commit.commit.author?.name || "Unknown",
+          message: (commit.commit.message.split("\n")[0] || "No message").slice(0, 140),
+          author: commit.author?.login || commit.commit.author?.name || "Unknown",
           date: commit.commit.author?.date || commit.commit.committer?.date || new Date().toISOString(),
           sha: commit.sha,
-          impactScore,
+          url: commit.html_url,
+          additions,
+          deletions,
+          filesChanged,
         };
       })
     );
-
-    const formattedIssues = issues.filter((i) => !i.pull_request).map((i) => ({
-      number: i.number,
-      title: i.title,
-      state: i.state,
-      createdAt: i.created_at,
-      updatedAt: i.updated_at,
-      author: i.user?.login || "Unknown",
-      labels: i.labels.map((l: any) => l.name),
-    }));
-
-    const formattedPRs = pulls.map((pr) => ({
-      number: pr.number,
-      title: pr.title,
-      state: pr.state,
-      createdAt: pr.created_at,
-      updatedAt: pr.updated_at,
-      author: pr.user?.login || "Unknown",
-      reviewers: pr.requested_reviewers?.map((r: any) => r.login) || [],
-    }));
-
-    return {
-      name: repoData.name,
-      description: repoData.description || "No description",
-      totalCommits: allCommits.length,
-      totalContributors: contributorStats.length,
-      codeFrequency,
-      contributors: contributorStats,
-      openIssues: formattedIssues.filter((i) => i.state === "open").length,
-      branches: branches.map((b) => b.name),
-      pullRequests: formattedPRs,
-      issues: formattedIssues,
-      fileTypes,
-      stargazers: repoData.stargazers_count,
-      forks: repoData.forks_count,
-      languages,
-      keyCommits: keyCommits.sort((a, b) => b.impactScore - a.impactScore).slice(0, 5),
-      averageIssueResolutionTime,
-      averagePRReviewTime,
-      commitFrequency,
-      commitsPerDay,
-    };
+    return detailed;
   } catch (error) {
-    console.error("Error fetching repo status:", error);
-    throw new Error(`Failed to fetch repo status: ${(error as Error).message}`);
+    const status = (error as { status?: number }).status;
+    if (status === 409) return [];
+    throw error;
   }
-};
+}
 
-// Standalone PR and Issues function
-export const PRandIssues = async (projectId: string) => {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: { githubUrl: true },
-  });
+async function fileTypes(owner: string, repo: string, branch: string) {
+  const { data } = await octokit.rest.git.getTree({ owner, repo, tree_sha: branch, recursive: "true" });
+  const paths = data.tree.flatMap((item) => (item.type === "blob" && item.path ? [item.path] : []));
+  return { fileTypes: summarizeFileTypes(paths), fileTypesTruncated: Boolean(data.truncated) };
+}
 
-  if (!project?.githubUrl) {
-    throw new Error("Project not found or GitHub URL missing");
-  }
+async function buildAnalytics(projectId: string, owner: string, repo: string): Promise<RepoAnalytics> {
+  const started = Date.now();
+  const { data: repoData } = await octokit.rest.repos.get({ owner, repo });
 
-  const { owner, repo } = parseRepoUrl(project.githubUrl);
+  const [
+    totalCommits,
+    branches,
+    languages,
+    contributorStats,
+    activityStats,
+    codeStats,
+    openIssues,
+    openPullRequests,
+    issues,
+    pulls,
+    commits,
+    files,
+  ] = await Promise.all([
+    quietly("commits", 0, () => commitCount(owner, repo)),
+    quietly("branches", 0, () => branchCount(owner, repo)),
+    quietly("languages", [] as LanguageShare[], async () => {
+      const { data } = await octokit.rest.repos.listLanguages({ owner, repo });
+      return shapeLanguages(data);
+    }),
+    quietly("contributors", { rows: [] as ContributorRow[], total: 0, pending: false }, async () => {
+      const stats = await readStats(() => octokit.rest.repos.getContributorsStats({ owner, repo }));
+      const shaped = shapeContributors(stats.data);
+      return { rows: shaped.rows.slice(0, SHOWN_CONTRIBUTORS), total: shaped.total, pending: stats.pending };
+    }),
+    quietly("activity", { series: null as ReturnType<typeof shapeActivity>, pending: false }, async () => {
+      const stats = await readStats(() => octokit.rest.repos.getCommitActivityStats({ owner, repo }));
+      return { series: stats.pending ? null : shapeActivity(stats.data), pending: stats.pending };
+    }),
+    quietly("code frequency", { series: null as ReturnType<typeof shapeCodeFrequency>, pending: false }, async () => {
+      const stats = await readStats(() => octokit.rest.repos.getCodeFrequencyStats({ owner, repo }));
+      return { series: stats.pending ? null : shapeCodeFrequency(stats.data), pending: stats.pending };
+    }),
+    quietly("open issues", null as number | null, () => openIssueCount(owner, repo)),
+    quietly("open pulls", 0, () => openPullCount(owner, repo)),
+    quietly("issue time", { average: null, sampleSize: 0 }, () => issueResolution(owner, repo)),
+    quietly("pr cycle", { average: null, sampleSize: 0 }, () => prCycle(owner, repo)),
+    quietly("recent commits", [], () => recentCommits(owner, repo)),
+    quietly("files", { fileTypes: [] as FileTypeShare[], fileTypesTruncated: false }, () =>
+      fileTypes(owner, repo, repoData.default_branch)
+    ),
+  ]);
 
+  const statsPending = contributorStats.pending || activityStats.pending || codeStats.pending;
+  const data: RepoAnalytics = {
+    name: repoData.name,
+    description: repoData.description || "No description",
+    htmlUrl: repoData.html_url,
+    defaultBranch: repoData.default_branch,
+    fetchedAt: new Date().toISOString(),
+    totalCommits,
+    totalContributors: contributorStats.total,
+    contributors: contributorStats.rows,
+    openIssues,
+    openPullRequests,
+    branchCount: branches,
+    stargazers: repoData.stargazers_count,
+    forks: repoData.forks_count,
+    languages,
+    fileTypes: files.fileTypes,
+    fileTypesTruncated: files.fileTypesTruncated,
+    commitsPerDay: activityStats.series?.commitsPerDay ?? [],
+    commitFrequency: activityStats.series?.commitFrequency ?? [],
+    codeFrequency: codeStats.series ?? [],
+    recentCommits: commits,
+    averageIssueResolutionTime: issues.average,
+    issueSampleSize: issues.sampleSize,
+    averagePrCycleTime: pulls.average,
+    prSampleSize: pulls.sampleSize,
+    statsPending,
+  };
+
+  remember(projectId, data);
+  console.log(`analytics ${owner}/${repo} ${Date.now() - started}ms pending=${statsPending}`);
+  return data;
+}
+
+export async function getRepoStatus(projectId: string, refresh = false): Promise<AnalyticsResult> {
   try {
-    const issues = await octokit.paginate(octokit.rest.issues.listForRepo, {
-      owner,
-      repo,
-      state: "all",
-      per_page: 100,
-    });
+    const access = await requireProjectRepo(projectId, "analytics");
+    if (!access.ok) return access;
 
-    const pulls = await octokit.paginate(octokit.rest.pulls.list, {
-      owner,
-      repo,
-      state: "all",
-      per_page: 100,
-    });
+    if (!refresh) {
+      const cached = readCache(projectId);
+      if (cached) return { ok: true, data: cached };
+      const pending = inflight.get(projectId);
+      if (pending) return { ok: true, data: await pending };
+    }
 
-    const formattedIssues = issues.filter((i) => !i.pull_request).map((i) => ({
-      number: i.number,
-      title: i.title,
-      state: i.state,
-      createdAt: i.created_at,
-      updatedAt: i.updated_at,
-      author: i.user?.login || "Unknown",
-      labels: i.labels.map((l: any) => l.name),
-    }));
-
-    const formattedPRs = pulls.map((pr) => ({
-      number: pr.number,
-      title: pr.title,
-      state: pr.state,
-      createdAt: pr.created_at,
-      updatedAt: pr.updated_at,
-      author: pr.user?.login || "Unknown",
-      reviewers: pr.requested_reviewers?.map((r: any) => r.login) || [],
-    }));
-
-    const closedIssues = issues.filter((i) => i.state === "closed" && !i.pull_request);
-    const issueResolutionTime = closedIssues.reduce((sum, issue) => {
-      const created = new Date(issue.created_at).getTime();
-      const closed = new Date(issue.closed_at || issue.updated_at).getTime();
-      return sum + (closed - created) / (1000 * 60 * 60 * 24);
-    }, 0);
-    const averageIssueResolutionTime = closedIssues.length ? Math.round((issueResolutionTime / closedIssues.length) * 10) / 10 : 0;
-
-    const closedPRs = pulls.filter((pr) => pr.state === "closed" && pr.closed_at);
-    const prReviewTime = closedPRs.reduce((sum, pr) => {
-      const created = new Date(pr.created_at).getTime();
-      const closed = new Date(pr.closed_at!).getTime();
-      return sum + (closed - created) / (1000 * 60 * 60 * 24);
-    }, 0);
-    const averagePRReviewTime = closedPRs.length ? Math.round((prReviewTime / closedPRs.length) * 10) / 10 : 0;
-
-    return {
-      name: `${owner}/${repo}`, // Simple name for now; could fetch from repoData if needed
-      pullRequests: formattedPRs,
-      issues: formattedIssues,
-      openIssues: formattedIssues.filter((i) => i.state === "open").length,
-      averageIssueResolutionTime,
-      averagePRReviewTime,
-    };
+    const work = buildAnalytics(projectId, access.owner, access.repo);
+    void work.catch(() => undefined);
+    inflight.set(projectId, work);
+    try {
+      return { ok: true, data: await withTimeout(work, FETCH_TIMEOUT_MS) };
+    } finally {
+      if (inflight.get(projectId) === work) inflight.delete(projectId);
+    }
   } catch (error) {
-    console.error("Error fetching PRs and Issues:", error);
-    throw new Error(`Failed to fetch PRs and Issues: ${(error as Error).message}`);
+    console.error("analytics failed", projectId, error);
+    return { ok: false, error: analyticsErrorMessage(error) };
   }
-};
+}
+
+interface WorkSummary {
+  openIssues: number | null;
+  openPullRequests: number | null;
+  averageIssueResolutionTime: number | null;
+  issueSampleSize: number;
+  averagePrCycleTime: number | null;
+  prSampleSize: number;
+}
+
+export interface WorkList extends WorkSummary {
+  name: string;
+  htmlUrl: string;
+  kind: WorkKind;
+  state: WorkState;
+  sort: WorkSort;
+  text: string;
+  page: number;
+  perPage: number;
+  total: number;
+  incomplete: boolean;
+  items: WorkItem[];
+  fetchedAt: string;
+}
+
+export type WorkListResult = { ok: true; data: WorkList } | { ok: false; error: string };
+
+async function requireProjectRepo(projectId: string, feature: string) {
+  const session = await getAuthSession();
+  if (!session?.user?.id) return { ok: false as const, error: `Sign in to view ${feature}.` };
+
+  const membership = await prisma.userToProject.findFirst({
+    where: { userId: session.user.id, projectId, project: { deletedAt: null } },
+    select: { project: { select: { githubUrl: true } } },
+  });
+  if (!membership) return { ok: false as const, error: "You don't have access to this project." };
+  if (!membership.project.githubUrl) return { ok: false as const, error: "This project has no GitHub repository." };
+
+  const repo = parseGithubUrl(membership.project.githubUrl);
+  if (!repo) return { ok: false as const, error: "This project's GitHub URL is invalid." };
+  return { ok: true as const, ...repo };
+}
+
+function rememberWork(key: string, data: WorkList) {
+  if (workCache.size >= 100) workCache.delete(workCache.keys().next().value!);
+  workCache.set(key, { at: Date.now(), data });
+}
+
+async function loadWorkSummary(owner: string, repo: string, refresh: boolean): Promise<WorkSummary> {
+  const key = `${owner}/${repo}`;
+  const hit = summaryCache.get(key);
+  if (!refresh && hit && Date.now() - hit.at < SUMMARY_TTL_MS) return hit.data;
+
+  const [openIssues, openPullRequests, issues, pulls] = await Promise.all([
+    quietly("open issues", null as number | null, () => openIssueCount(owner, repo)),
+    quietly("open pulls", null as number | null, () => openPullCount(owner, repo)),
+    quietly("issue time", { average: null, sampleSize: 0 }, () => issueResolution(owner, repo)),
+    quietly("pr cycle", { average: null, sampleSize: 0 }, () => prCycle(owner, repo)),
+  ]);
+  const data: WorkSummary = {
+    openIssues,
+    openPullRequests,
+    averageIssueResolutionTime: issues.average,
+    issueSampleSize: issues.sampleSize,
+    averagePrCycleTime: pulls.average,
+    prSampleSize: pulls.sampleSize,
+  };
+  if (summaryCache.size >= 50) summaryCache.delete(summaryCache.keys().next().value!);
+  summaryCache.set(key, { at: Date.now(), data });
+  return data;
+}
+
+async function buildWorkList(
+  owner: string,
+  repo: string,
+  url: string,
+  query: ReturnType<typeof normalizeWorkQuery>,
+  refresh: boolean
+): Promise<WorkList> {
+  const order = workSearchOrder(query.sort);
+  const [summary, search] = await Promise.all([
+    loadWorkSummary(owner, repo, refresh),
+    octokit.request("GET /search/issues", {
+      q: workSearchQuery(owner, repo, query.kind, query.state, query.text),
+      sort: order.sort,
+      order: order.order,
+      per_page: WORK_PER_PAGE,
+      page: query.page,
+    }),
+  ]);
+  return {
+    ...summary,
+    name: `${owner}/${repo}`,
+    htmlUrl: url,
+    kind: query.kind,
+    state: query.state,
+    sort: query.sort,
+    text: query.text,
+    page: query.page,
+    perPage: WORK_PER_PAGE,
+    total: search.data.total_count,
+    incomplete: Boolean(search.data.incomplete_results),
+    items: search.data.items.map((item) => shapeWorkItem(item, query.state === "merged")),
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+export async function getWorkItems(
+  projectId: string,
+  input: { kind?: WorkKind; state?: WorkState; sort?: WorkSort; page?: number; text?: string } = {},
+  refresh = false
+): Promise<WorkListResult> {
+  try {
+    const access = await requireProjectRepo(projectId, "pull requests and issues");
+    if (!access.ok) return access;
+
+    const query = normalizeWorkQuery(input);
+    const key = `${projectId}:${query.kind}:${query.state}:${query.sort}:${query.page}:${query.text.toLowerCase()}`;
+    if (!refresh) {
+      const cached = workCache.get(key);
+      if (cached && Date.now() - cached.at < WORK_CACHE_TTL_MS) return { ok: true, data: cached.data };
+      const pending = workInflight.get(key);
+      if (pending) return { ok: true, data: await pending };
+    }
+
+    const started = Date.now();
+    const work = buildWorkList(access.owner, access.repo, access.url, query, refresh);
+    void work.catch(() => undefined);
+    workInflight.set(key, work);
+    try {
+      const data = await withTimeout(work, FETCH_TIMEOUT_MS);
+      rememberWork(key, data);
+      console.log(`work items ${access.owner}/${access.repo} ${query.kind} ${query.state} p${query.page} ${Date.now() - started}ms`);
+      return { ok: true, data };
+    } finally {
+      if (workInflight.get(key) === work) workInflight.delete(key);
+    }
+  } catch (error) {
+    console.error("work items failed", projectId, error);
+    const status = (error as { status?: number }).status;
+    if (status === 422) return { ok: false, error: "GitHub couldn't run that search. Try a different phrase." };
+    return { ok: false, error: analyticsErrorMessage(error) };
+  }
+}

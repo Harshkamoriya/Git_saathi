@@ -5,7 +5,7 @@ import { Skeleton } from "@/components/ui/skeleton"; // Assuming you have a Skel
 
 const Loading = () => {
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-100 to-gray-200 dark:from-gray-900 dark:to-gray-800 p-6">
+    <div className="p-2">
       <div className="max-w-5xl mx-auto">
         {/* Title and Description Skeleton */}
         <Skeleton className="h-8 w-1/3 bg-gray-300 dark:bg-gray-700 mb-2 rounded" />

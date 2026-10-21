@@ -1,19 +1,6 @@
+import RepoInsights from "./analytics";
 
-import RepoInsights from './analytics';
-import React from 'react'
-interface Props {
-  params: Promise<{ projectId: string }>;
-}
-
-const Analytics =async ({ params }: Props) => {
+export default async function Analytics({ params }: { params: Promise<{ projectId: string }> }) {
   const { projectId } = await params;
-    console.log("projectId", projectId);
-    
-  return (
-    <div>
-        <RepoInsights projectId={projectId}></RepoInsights>
-    </div>
-  )
+  return <RepoInsights projectId={projectId} />;
 }
-
-export default Analytics
