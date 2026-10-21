@@ -1,6 +1,9 @@
 "use client";
 
-import React, { useState, useRef } from "react";
+import React, { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Loader2 } from "lucide-react";
+import { getReferenceSource } from "@/lib/retrival";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -16,29 +19,83 @@ import {
 
 interface FileReference {
   fileName: string;
-  sourceCode: string;
+  sourceCode?: string;
   summary: string;
   score?: number;
 }
 
 interface CodeReferencePanelProps {
+  projectId?: string;
   file: FileReference;
   allReferences: FileReference[];
   onClose: () => void;
   onChangeReference: (file: FileReference) => void;
 }
 
+const LANGUAGE_BY_EXTENSION: Record<string, string> = {
+  ts: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  jsx: "jsx",
+  mjs: "javascript",
+  cjs: "javascript",
+  py: "python",
+  go: "go",
+  rs: "rust",
+  java: "java",
+  kt: "kotlin",
+  rb: "ruby",
+  php: "php",
+  cs: "csharp",
+  cpp: "cpp",
+  c: "c",
+  h: "c",
+  css: "css",
+  scss: "scss",
+  html: "markup",
+  vue: "markup",
+  svelte: "markup",
+  json: "json",
+  yml: "yaml",
+  yaml: "yaml",
+  md: "markdown",
+  sql: "sql",
+  sh: "bash",
+  prisma: "graphql",
+};
+
+function languageFor(fileName: string) {
+  const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+  return LANGUAGE_BY_EXTENSION[ext] ?? "text";
+}
+
 const CodeReferencePanel: React.FC<CodeReferencePanelProps> = ({
+  projectId,
   file,
   allReferences,
   onClose,
   onChangeReference,
 }) => {
   const [copied, setCopied] = useState(false);
-  const sourceCodeScrollRef = useRef<HTMLDivElement>(null);
+
+  // Answers no longer carry full source; fetch it when the file is opened
+  const { data: loadedSource, isLoading, isError } = useQuery({
+    queryKey: ["reference-source", projectId, file.fileName],
+    queryFn: async () => {
+      const result = await getReferenceSource(projectId!, file.fileName);
+      if (!result.ok) throw new Error(result.error);
+      return result.sourceCode;
+    },
+    enabled: !file.sourceCode && !!projectId,
+    staleTime: Infinity,
+    retry: 1,
+  });
+
+  const sourceCode = file.sourceCode ?? loadedSource ?? "";
 
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(file.sourceCode);
+    if (!sourceCode) return;
+    navigator.clipboard.writeText(sourceCode);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -126,8 +183,16 @@ const CodeReferencePanel: React.FC<CodeReferencePanelProps> = ({
               <ScrollArea className="h-full w-full">
                 <div className="w-full overflow-auto">
                   <div className="min-w-full">
+                    {isLoading ? (
+                      <div className="flex items-center gap-2 p-6 text-sm text-gray-500">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Loading source…
+                      </div>
+                    ) : isError || !sourceCode ? (
+                      <p className="p-6 text-sm text-gray-500">Couldn&apos;t load this file&apos;s source.</p>
+                    ) : (
                     <SyntaxHighlighter
-                      language="typescript"
+                      language={languageFor(file.fileName)}
                       style={oneDark}
                       customStyle={{
                         margin: 0,
@@ -143,8 +208,9 @@ const CodeReferencePanel: React.FC<CodeReferencePanelProps> = ({
                       showLineNumbers={true}
                       lineNumberStyle={{ minWidth: "2em", paddingRight: "1em" }}
                     >
-                      {file.sourceCode}
+                      {sourceCode}
                     </SyntaxHighlighter>
+                    )}
                   </div>
                 </div>
                 <ScrollBar orientation="horizontal" />
@@ -159,7 +225,10 @@ const CodeReferencePanel: React.FC<CodeReferencePanelProps> = ({
             <div className="h-[calc(100vh-130px)] border border-orange-200 dark:border-orange-900/50 rounded-md bg-orange-50 dark:bg-orange-900/20 p-4 overflow-hidden">
               <ScrollArea className="h-full">
                 <div className="prose prose-sm max-w-none text-gray-600 dark:text-gray-300">
-                  <MemoizedMarkdown content={file.summary} id={file.fileName} />
+                  <MemoizedMarkdown
+                    content={file.summary || "_No summary for this file. Reindex the project to generate one._"}
+                    id={file.fileName}
+                  />
                 </div>
               </ScrollArea>
             </div>

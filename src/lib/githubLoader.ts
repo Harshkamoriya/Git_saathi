@@ -9,7 +9,7 @@ import { uploadToPinecone } from './pineconedb';
 import { PineconeRecord } from '@pinecone-database/pinecone';
 import { generateEmbedding } from './repoEmbedding';
 import { summariseCode_2 } from './gemini2';
-import { ignorePathPatterns, parseGithubUrl, shouldIndexPath } from './repoRules';
+import { ignorePathPatterns, parseGithubUrl, shouldIndexPath, vectorIdFor } from './repoRules';
 
 
 const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
@@ -289,7 +289,7 @@ export const RepoGenerateEmbeddings = async (
 
     if (successfulResults.length > 0) {
       const vectors: PineconeRecord[] = successfulResults.map((result) => ({
-        id: `${projectId}_${result.fileName.replace(/[^a-zA-Z0-9-_]/g, "_")}`,
+        id: vectorIdFor(projectId, result.fileName),
         values: result.embedding,
         metadata: {
           fileName: result.fileName,

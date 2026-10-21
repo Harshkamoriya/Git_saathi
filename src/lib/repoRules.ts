@@ -70,6 +70,11 @@ export function ignorePathPatterns(): string[] {
   ];
 }
 
+/** Pinecone record id for a file; indexing and lookups must agree on this. */
+export function vectorIdFor(projectId: string, fileName: string) {
+  return `${projectId}_${fileName.replace(/[^a-zA-Z0-9-_]/g, "_")}`;
+}
+
 const NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
 
 /**

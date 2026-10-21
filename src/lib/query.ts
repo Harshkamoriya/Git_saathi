@@ -69,28 +69,6 @@ export async function CreateProject(githubUrl: string, name: string): Promise<Cr
   return { ok: true, project, fileCount };
 }
 
-export async function GetProjects() {
-  const session = await getAuthSession();
-  const userId = session?.user?.id;
-
-  if (!userId) throw new Error("Unauthorized");
-
-  try {
-    const projects = await prisma.project.findMany({
-      where: { 
-        users: { some: { id: userId } },
-       },
-    });
-
-    return projects;
-  } catch (error) {
-    console.error("Error fetching projects:", error);
-    throw new Error(`Failed to fetch projects: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
-  }
-}
-
 export async function getCommit(projectId:string) {
   // const session = await getAuthSession();
   // const userId = session?.user?.id;
@@ -107,19 +85,24 @@ export async function getCommit(projectId:string) {
   } catch (error) {
     console.error("Error fetching commits:", error);
     throw new Error(`Failed to fetch commits: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
   }
   
 }
 
 export async function GetProjectById(projectId: string) {
-  const project = await prisma.project.findUnique({
-    where: { id: projectId },
+  const session = await getAuthSession();
+  const userId = session?.user?.id;
+  if (!userId) throw new Error("Please sign in again.");
+
+  // Membership is part of the filter, so other users' projects look the same as missing ones
+  const project = await prisma.project.findFirst({
+    where: { id: projectId, deletedAt: null, users: { some: { userId } } },
     include: {
       users: {
-        include: {
-          user: true,
+        orderBy: { createdAt: "asc" },
+        select: {
+          createdAt: true,
+          user: { select: { id: true, name: true, image: true } },
         },
       },
     },
@@ -141,61 +124,110 @@ export async function getCommits(projectId: string) {
 
   return commits;
 }
-interface UserToProject {
-  project: {
-    id: string;
-    name: string;
-    githubUrl: string | null;
-  };
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  githubUrl: string | null;
+  indexingStatus: string;
+  createdAt: Date;
+  updatedAt: Date;
+  joinedAt: Date;
+  isOwner: boolean;
+  counts: { commits: number; meetings: number; members: number };
 }
 
-export async function GetAllProject() {
+// There is no owner column; the first member (the creator) is treated as the owner
+async function getOwnerId(projectId: string) {
+  const first = await prisma.userToProject.findFirst({
+    where: { projectId },
+    orderBy: { createdAt: "asc" },
+    select: { userId: true },
+  });
+  return first?.userId ?? null;
+}
+
+export async function GetAllProjects(): Promise<ProjectSummary[]> {
   const session = await getAuthSession();
   const userId = session?.user?.id;
-  if (!session) redirect("/login");
+  if (!userId) redirect("/login");
+
+  const memberships = await prisma.userToProject.findMany({
+    where: { userId, project: { deletedAt: null } },
+    orderBy: { project: { updatedAt: "desc" } },
+    select: {
+      createdAt: true,
+      project: {
+        select: {
+          id: true,
+          name: true,
+          githubUrl: true,
+          indexingStatus: true,
+          createdAt: true,
+          updatedAt: true,
+          _count: { select: { commits: true, meetings: true, users: true } },
+          users: { orderBy: { createdAt: "asc" }, take: 1, select: { userId: true } },
+        },
+      },
+    },
+  });
+
+  return memberships.map(({ createdAt, project }) => ({
+    id: project.id,
+    name: project.name,
+    githubUrl: project.githubUrl,
+    indexingStatus: project.indexingStatus,
+    createdAt: project.createdAt,
+    updatedAt: project.updatedAt,
+    joinedAt: createdAt,
+    isOwner: project.users[0]?.userId === userId,
+    counts: {
+      commits: project._count.commits,
+      meetings: project._count.meetings,
+      members: project._count.users,
+    },
+  }));
+}
+
+export async function ArchiveProject(projectId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const session = await getAuthSession();
+  const userId = session?.user?.id;
+  if (!userId) return { ok: false, error: "Please sign in again." };
 
   try {
-    const projects: UserToProject[] = await prisma.userToProject.findMany({
-      where: { userId: userId as string },
-      include: {
-        project: true, // Fetch project details
-      },
+    const ownerId = await getOwnerId(projectId);
+    if (!ownerId) return { ok: false, error: "Project not found." };
+    if (ownerId !== userId) return { ok: false, error: "Only the person who created this project can archive it." };
+
+    const updated = await prisma.project.updateMany({
+      where: { id: projectId, deletedAt: null },
+      data: { deletedAt: new Date() },
     });
-
-    console.log("Fetched projects:", projects);
-
-    return projects.map((userToProject: { project: any }) => userToProject.project);
+    if (updated.count === 0) return { ok: false, error: "Project not found." };
+    return { ok: true };
   } catch (error) {
-    console.error("Error fetching projects:", error);
-    throw new Error("Failed to fetch projects");
+    console.error(`ArchiveProject failed for ${projectId}:`, error);
+    return { ok: false, error: "Couldn't archive the project. Please try again." };
   }
 }
 
-
-export async function GetAllProjects() {
+export async function LeaveProject(projectId: string): Promise<{ ok: true } | { ok: false; error: string }> {
   const session = await getAuthSession();
   const userId = session?.user?.id;
-  if (!session) redirect("/login");
+  if (!userId) return { ok: false, error: "Please sign in again." };
 
   try {
-    const projects = await prisma.userToProject.findMany({
-      where: { userId: userId as string },
-      orderBy: { createdAt: "desc" },
-      include: {
-        project: {
-          include: {
-            commits: true,
-            meetings: true,
-            users: true // This will include all users associated with the project
-          }
-        }
-      },
-    });
-    console.log("Fetched projects:", projects);
-    return projects.map((userToProject: { project: any }) => userToProject.project);
+    const ownerId = await getOwnerId(projectId);
+    if (!ownerId) return { ok: false, error: "Project not found." };
+    if (ownerId === userId) {
+      return { ok: false, error: "You created this project. Archive it instead of leaving." };
+    }
+
+    const removed = await prisma.userToProject.deleteMany({ where: { userId, projectId } });
+    if (removed.count === 0) return { ok: false, error: "You're not a member of this project." };
+    return { ok: true };
   } catch (error) {
-    console.error("Error fetching projects:", error);
-    throw new Error("Failed to fetch projects");
+    console.error(`LeaveProject failed for ${projectId}:`, error);
+    return { ok: false, error: "Couldn't leave the project. Please try again." };
   }
 }
 
@@ -204,8 +236,8 @@ export async function JoinProject(projectId: string ) {
   const session = await getAuthSession();
   if (!session) redirect("/login");
   try {   
-    const project = await prisma.project.findUnique({
-      where: { id: projectId },
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, deletedAt: null },
     });
     if(!project) {
       throw new Error("Project not found");
@@ -236,8 +268,6 @@ export async function JoinProject(projectId: string ) {
   catch (error) {
     console.error("Error joining project:", error);
     throw new Error(`Failed to join project: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
   }
 
 }
@@ -266,8 +296,6 @@ export async function allMembers(projectId : string){
   catch (error) {
     console.error("Error fetching members:", error);
     throw new Error(`Failed to fetch members: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
   }
 }
 
@@ -286,7 +314,5 @@ export async function MeetingStatus(meetingId: string) {
   } catch (error) {
     console.error("Error fetching meeting status:", error);
     throw new Error(`Failed to fetch meeting status: ${(error as Error).message}`);
-  } finally {
-    await prisma.$disconnect();
   }
 }

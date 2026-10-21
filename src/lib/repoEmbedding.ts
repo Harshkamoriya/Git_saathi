@@ -11,6 +11,8 @@ const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
 const EMBEDDING_DIMENSIONS = 768; // match Pinecone index / former text-embedding-004 size
 
 const embeddingCache = new Map<string, number[]>();
+// Long-running dev/server processes would otherwise keep every embedded text in memory
+const MAX_CACHE_ENTRIES = 500;
 const MAX_PAYLOAD_SIZE = 9000;
 
 /**
@@ -62,6 +64,9 @@ export async function generateEmbedding(text: string, retries: number = 3, timeo
       const embedding = await Promise.race([embeddingPromise, timeoutPromise]);
       if (isZeroVector(embedding)) {
         throw new Error("API returned an all-zero vector");
+      }
+      if (embeddingCache.size >= MAX_CACHE_ENTRIES) {
+        embeddingCache.delete(embeddingCache.keys().next().value!);
       }
       embeddingCache.set(text, embedding);
       return embedding;

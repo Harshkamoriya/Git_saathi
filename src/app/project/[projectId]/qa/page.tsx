@@ -1,11 +1,11 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { askQuestion } from "@/lib/retrival";
+import { askQuestion, type ChatTurn } from "@/lib/retrival";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Loader2, Send, RotateCw, Trash2, AlertTriangle } from "lucide-react";
+import { Loader2, Send, RotateCw, Trash2, AlertTriangle, Copy, Check } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import Image from "next/image";
 import { readStreamableValue } from "ai/rsc";
@@ -19,7 +19,7 @@ import { GetProjectById } from "@/lib/query";
 
 interface FileReference {
   fileName: string;
-  sourceCode: string;
+  sourceCode?: string;
   summary: string;
   score?: number;
 }
@@ -60,15 +60,49 @@ function loadHistory(storageKey: string): StoredMessages | null {
       localStorage.removeItem(storageKey);
       return null;
     }
-    // Drop raw server stack traces saved by older builds
+    // Drop raw server stack traces and full file sources saved by older builds
     const messages = parsed.messages
       .filter((m) => !(m.type === "answer" && RAW_ERROR_PATTERN.test(m.content)))
-      .map((m) => ({ ...m, timestamp: new Date(m.timestamp) }));
+      .map((m) => ({
+        ...m,
+        timestamp: new Date(m.timestamp),
+        filesReferences: m.filesReferences?.map(({ fileName, summary, score }) => ({ fileName, summary, score })),
+      }));
     return { messages, storedAt: parsed.storedAt };
   } catch {
     localStorage.removeItem(storageKey);
     return null;
   }
+}
+
+// Recent successful turns, so follow-ups like "where is it called?" keep their context
+function historyFor(messages: Message[]): ChatTurn[] {
+  const turns: ChatTurn[] = [];
+  messages.forEach((m, i) => {
+    const prev = messages[i - 1];
+    if (m.type !== "answer" || m.failed || prev?.type !== "question") return;
+    turns.push({ role: "user", content: prev.content }, { role: "assistant", content: m.content });
+  });
+  return turns.slice(-6);
+}
+
+function CopyAnswerButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      className="flex items-center gap-1 text-xs text-gray-500 hover:text-orange-500 dark:text-gray-400"
+      aria-label="Copy answer"
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
 }
 
 function ReferenceChips({
@@ -226,7 +260,7 @@ export default function QA() {
       try {
         await Promise.race([
           (async () => {
-            const { output, filesReferences } = await askQuestion(trimmed, projectId);
+            const { output, filesReferences } = await askQuestion(trimmed, projectId, historyFor(messages));
             if (cancelled) return;
             setActiveReferences(filesReferences);
 
@@ -270,7 +304,7 @@ export default function QA() {
         textareaRef.current?.focus();
       }
     },
-    [projectId]
+    [projectId, messages]
   );
 
   const handleSubmit = (e?: React.FormEvent) => {
@@ -448,7 +482,10 @@ export default function QA() {
                     onOpen={(file) => openReference(file, message.filesReferences || [])}
                   />
                   <div className="mt-2 flex items-center justify-between gap-3">
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{format(message.timestamp, "MMM d, h:mm a")}</p>
+                    <div className="flex items-center gap-3">
+                      <p className="text-xs text-gray-500 dark:text-gray-400">{format(message.timestamp, "MMM d, h:mm a")}</p>
+                      {!message.failed && <CopyAnswerButton text={message.content} />}
+                    </div>
                     {message.failed && message.question && (
                       <button
                         type="button"
@@ -551,6 +588,7 @@ export default function QA() {
             onClick={closeReference}
           >
             <CodeReferencePanel
+              projectId={projectId}
               file={selectedReference}
               allReferences={currentReferenceFiles}
               onClose={closeReference}

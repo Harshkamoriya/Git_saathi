@@ -15,6 +15,32 @@ Grouped by feature. Each item: **Today** → **Better** → **Why**.
 
 ---
 
+## Open issues (left over from the Oct 21 fix pass)
+
+Create project
+- [ ] **Private repos + ownership check** — list repos with the logged-in user's GitHub OAuth token (`repo` scope, `GET /user/repos`) instead of the server token; today anyone can index any public repo by typing its owner's username.
+- [ ] **Real indexing progress** — add `indexedFiles` / `totalFiles` columns to `Project` (schema migration), update them per batch, show a real percentage in `IndexingBanner`.
+- [ ] **Move indexing to a job queue** — `after()` still runs inside the function's time limit on Vercel; large repos need Inngest / QStash / a worker.
+- [ ] **Clear the Pinecone namespace before reindex** — deleted files leave stale vectors.
+
+Projects list
+- [ ] **Owner / roles column** — "owner" is currently the earliest `UserToProject` row; add `role` (OWNER / MEMBER) to `UserToProject` or `ownerId` to `Project`.
+- [ ] **Restore archived projects** — archive is a soft delete (`deletedAt`) with no UI to view or restore archived projects.
+
+Auth (do with the Login feature)
+- [ ] **`/create`, `/projects`, `/billing`, `/join` load without a session** — add them to the middleware matcher and redirect in `(protected)/layout.tsx`; server actions already refuse, so this is a UX gate.
+
+Ask me
+- [ ] **Verify Gemini model IDs on the real key** — answers try `gemini-3.5-flash-lite` → `gemini-3.8-flash` → `gemini-3.6-flash`; not smoke-tested against the project's API key.
+- [ ] **Stream tokens again** — answers are generated in one call and sent at once (streaming was hanging); bring back streaming with a timeout once the SDK path is reliable.
+- [ ] **Shared rate limiter** — the 15 questions/min limit is in-memory per server instance; move it to Redis/Upstash for multi-instance deploys.
+- [ ] **Chunk large files** — each file is one vector (summary + first 20KB); split big files into chunks so questions about the end of a file can match.
+- [ ] **Hybrid search + reranking** — add keyword (BM25) search next to vectors and rerank the top candidates for better precision.
+- [ ] **Eval set** — keep ~20 fixed questions per demo repo with expected files, and measure retrieval hit-rate before changing prompts/models.
+- [ ] **Server-side chat history** — chats live in localStorage (per browser, 24h); store them in the DB to sync across devices and share with project members.
+
+---
+
 ## 1. Auth / Login
 
 - **Protected routes not consistent**

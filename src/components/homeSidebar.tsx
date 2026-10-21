@@ -1,6 +1,5 @@
 "use client";
 
-import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {
@@ -30,21 +29,8 @@ import {
   SidebarMenuButton,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { GetAllProjects } from "@/lib/query"; // Corrected import name
-
-const fetchProjects = async (): Promise<{ id: string; name: string }[]> => {
-  const projects = await GetAllProjects();
-  if (Array.isArray(projects)) {
-    return projects
-      .map((project: { id: string; name: string | null }) => ({
-        id: project.id,
-        name: project.name || "Unnamed Project",
-      }))
-      .slice(0, 5); // Limit to 5 projects
-  }
-  console.error("Expected an array but received:", projects);
-  return [];
-};
+import { useQuery } from "@tanstack/react-query";
+import { GetAllProjects } from "@/lib/query";
 
 const items = [
   { title: "Create", url: "create", icon: Plus },
@@ -55,15 +41,9 @@ const items = [
 export function AppSidebar() {
   const pathname = usePathname();
   const { open, setOpen } = useSidebar();
-  const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
-
-  useEffect(() => {
-    const loadProjects = async () => {
-      const fetchedProjects = await fetchProjects();
-      setProjects(fetchedProjects);
-    };
-    loadProjects();
-  }, []);
+  // Same cache as the /projects page, so creating, archiving or leaving updates both
+  const { data } = useQuery({ queryKey: ["projects"], queryFn: () => GetAllProjects() });
+  const projects = (data ?? []).slice(0, 5);
 
   const segments = pathname.split("/").filter(Boolean);
   const projectId = segments[1];
